@@ -25,6 +25,7 @@ export function Board() {
       <div>
         <div className="text-[11px] tracking-[0.18em] uppercase text-mute">Global</div>
         <h1 className="text-xl font-semibold">Leaderboard</h1>
+        <p className="text-[11px] text-mute mt-1">Equity includes cash, live position values, and the APEX vault. PnL includes partial sells that are still open.</p>
       </div>
       <div className="grid grid-cols-3 gap-2">
         {SORTS.map((s) => (

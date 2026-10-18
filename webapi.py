@@ -39,7 +39,8 @@ _last_record_ts = 0.0
 _last_refresh_ts = 0.0
 FEED_CAP = 80
 SCAN_CAP = 24
-FEED_STALE_S = 90
+# sniper_job record_scans every 5 minutes. The old 90s loop started a second
+# full scan and raced that job. The loop below only backfills an empty feed.
 
 
 def _max_age() -> int:
@@ -201,6 +202,11 @@ def _public_token(contract: str, info: dict, sc: dict, ai: dict | None = None, s
         "holder_retention_pct": info.get("holder_retention_pct"),
         "kol_exit_note": info.get("kol_exit_note") or "",
         "helius": bool(os.getenv("HELIUS_API_KEY")),
+        "pf_curve": info.get("pf_curve"),
+        "pf_graduated": bool(info.get("pf_graduated")),
+        "pf_replies": info.get("pf_replies") or 0,
+        "pf_dev_pct": info.get("pf_dev_pct"),
+        "virtual_sol_reserves": info.get("virtual_sol_reserves") or info.get("pf_virtual_sol_lamports"),
     }
     if ai:
         out["ai"] = {
@@ -309,7 +315,8 @@ def _me_payload(uid: int, ud: dict) -> dict:
             marked_known = False
     equity = None
     if _balance_ready(ud):
-        equity = round(_num(balance) + savings + marked, 4)
+        # Cash + savings + unspent APEX vault + every open position at the live mark.
+        equity = round(_num(balance) + savings + _num(ud.get("apex_vault")) + marked, 4)
     return {
         "paper": True,
         "uid": uid,
@@ -355,6 +362,11 @@ def _apex_exit_view(h: dict) -> dict | None:
         "trail_pct": trail,
         "rules": rules,
     }
+
+
+def _open_realized(d: dict) -> float:
+    """Partial-sell PnL still sitting on open holdings. Closed rounds are in the log."""
+    return sum(_num(h.get("realized_total")) for h in (d.get("holdings") or {}).values())
 
 
 def _mark_holdings(d: dict) -> float:
@@ -473,9 +485,9 @@ def _leaderboard(sort: str, me: int) -> list[dict]:
             continue
         wins = [t for t in logs if _num(t.get("realized_pnl")) > 0]
         wr = round(len(wins) / len(logs) * 100, 1) if logs else 0.0
-        pnl = sum(_num(t.get("realized_pnl")) for t in logs)
+        pnl = sum(_num(t.get("realized_pnl")) for t in logs) + _open_realized(d)
         marked = _mark_holdings(d)
-        eq = _num(d.get("balance")) + marked + _num(d.get("savings"))
+        eq = _num(d.get("balance")) + marked + _num(d.get("savings")) + _num(d.get("apex_vault"))
         start = _num(d.get("starting_balance"), 5000) or 5000
         growth = round((eq - start) / start * 100, 1) if start > 0 else 0.0
         scores.append({
@@ -646,53 +658,70 @@ async def _refresh_feed_body() -> int:
         if addr and addr not in seen:
             seen.add(addr)
             items.append(item)
-        if len(items) >= SCAN_CAP:
-            break
     if not items:
         _last_refresh_ts = time.time()
         return 0
-    await asyncio.gather(
-        *[bot.get_token(i["tokenAddress"]) for i in items],
-        return_exceptions=True,
-    )
+    # pump.fun births are first in sniper_scan and usually have no DexScreener
+    # pair yet. Walk past those so the first SCAN_CAP rows are tokens we can price.
+    def _rank(item: dict) -> int:
+        if item.get("pairAddress") or item.get("pair_addr"):
+            return 0
+        if (item.get("source") or "") == "dexscreener":
+            return 1
+        return 2
+
+    items.sort(key=_rank)
     scored = 0
-    for item in items:
-        contract = item["tokenAddress"]
-        info = await bot.get_token(contract)
-        if not info:
-            continue
-        info["pf_curve"] = item.get("_pf_curve")
-        info["pf_replies"] = item.get("_pf_replies", 0)
-        info["pf_graduated"] = item.get("_pf_graduated", False)
-        info["pf_dev_pct"] = item.get("_pf_dev_pct")
-        if item.get("_pf_virtual_sol_lamports"):
-            info["virtual_sol_reserves"] = item["_pf_virtual_sol_lamports"]
-            info["pf_virtual_sol_lamports"] = item["_pf_virtual_sol_lamports"]
-        info["boost_amount"] = item.get("_boost_amount", info.get("boost_amount") or 0)
-        if not info.get("twitter") and item.get("_pf_twitter"):
-            info["twitter"] = item["_pf_twitter"]
-        if not info.get("telegram") and item.get("_pf_telegram"):
-            info["telegram"] = item["_pf_telegram"]
-        if not info.get("website") and item.get("_pf_website"):
-            info["website"] = item["_pf_website"]
-        sc = bot.sniper_score(info)
-        record_scan(contract, info, sc, source="scan")
-        scored += 1
+    idx = 0
+    while idx < len(items) and scored < SCAN_CAP:
+        batch = items[idx:idx + 12]
+        idx += 12
+        infos = await asyncio.gather(
+            *[bot.get_token(i["tokenAddress"]) for i in batch],
+            return_exceptions=True,
+        )
+        for item, info in zip(batch, infos):
+            if isinstance(info, Exception) or not info or not info.get("pair_addr"):
+                continue
+            info["pf_curve"] = item.get("_pf_curve") if item.get("_pf_curve") is not None else info.get("pf_curve")
+            info["pf_replies"] = item.get("_pf_replies", info.get("pf_replies") or 0)
+            info["pf_graduated"] = item.get("_pf_graduated", info.get("pf_graduated", False))
+            info["pf_dev_pct"] = item.get("_pf_dev_pct") if item.get("_pf_dev_pct") is not None else info.get("pf_dev_pct")
+            if item.get("_pf_virtual_sol_lamports"):
+                info["virtual_sol_reserves"] = item["_pf_virtual_sol_lamports"]
+                info["pf_virtual_sol_lamports"] = item["_pf_virtual_sol_lamports"]
+            if item.get("_pf_real_token_reserves") is not None:
+                info["real_token_reserves"] = item["_pf_real_token_reserves"]
+            if item.get("_pf_quote_decimals") is not None:
+                info["quote_decimals"] = item["_pf_quote_decimals"]
+            info["boost_amount"] = item.get("_boost_amount", info.get("boost_amount") or 0)
+            if not info.get("twitter") and item.get("_pf_twitter"):
+                info["twitter"] = item["_pf_twitter"]
+            if not info.get("telegram") and item.get("_pf_telegram"):
+                info["telegram"] = item["_pf_telegram"]
+            if not info.get("website") and item.get("_pf_website"):
+                info["website"] = item["_pf_website"]
+            sc = bot.sniper_score(info)
+            record_scan(contract=item["tokenAddress"], info=info, sc=sc, source="scan")
+            scored += 1
+            if scored >= SCAN_CAP:
+                break
     _last_refresh_ts = time.time()
     return scored
 
 
 async def _feed_loop() -> None:
-    await asyncio.sleep(8)
+    """Backfill an empty terminal. sniper_job already publishes scans."""
+    await asyncio.sleep(45)
     while True:
         try:
-            if time.time() - max(_last_record_ts, _last_refresh_ts) > FEED_STALE_S:
+            if not _feed and time.time() - _last_record_ts > 20:
                 await refresh_feed()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("terminal feed refresh")
-        await asyncio.sleep(120)
+        await asyncio.sleep(60)
 
 
 def _candles_from_ohlcv(rows: list) -> list[dict]:
@@ -817,6 +846,14 @@ def create_app() -> FastAPI:
             await enrich_onchain(contract, info)
         except Exception:
             logger.debug("token detail enrich failed", exc_info=True)
+        fed = _feed.get(contract) or {}
+        bot.carry_curve_fields(info, {
+            "pf_curve": fed.get("pf_curve"),
+            "pf_graduated": fed.get("pf_graduated"),
+            "pf_replies": fed.get("pf_replies"),
+            "pf_dev_pct": fed.get("pf_dev_pct"),
+            "virtual_sol_reserves": fed.get("virtual_sol_reserves"),
+        })
         sc = bot.sniper_score(info)
         ai = await bot.ai_analyze_token(info, sc, ud, uid)
         payload = _public_token(contract, info, sc, ai=ai, source="detail")
@@ -844,13 +881,20 @@ def create_app() -> FastAPI:
         else:
             payload["position"] = None
         try:
-            from slippage import slippage_pct, trade_cost_usd
+            from slippage import slippage_pct, trade_cost_usd, tradable_liquidity_usd
             sample = _num(ud.get("quick_buy_amount"), 100) or 100
-            payload["slippage"] = {
-                "sample_usd": sample,
-                "slippage_pct": round(slippage_pct(sample, info.get("liq")) * 100, 3),
-                "cost_usd": trade_cost_usd(sample, info.get("liq")),
-            }
+            tradable = tradable_liquidity_usd(info.get("liq"), None)
+            if tradable is None:
+                quote = await bot.bonding_curve_quote_usd(info, contract)
+                tradable = tradable_liquidity_usd(0, quote)
+            if tradable is None:
+                payload["slippage"] = None
+            else:
+                payload["slippage"] = {
+                    "sample_usd": sample,
+                    "slippage_pct": round(slippage_pct(sample, tradable) * 100, 3),
+                    "cost_usd": trade_cost_usd(sample, tradable),
+                }
         except Exception:
             payload["slippage"] = None
         return payload

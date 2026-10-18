@@ -161,6 +161,7 @@ export interface Trade {
   closed_at: string | null;
   invested: number;
   returned: number;
+  fees_paid?: number | null;
 }
 
 export interface ApexStatus {

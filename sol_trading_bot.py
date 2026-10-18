@@ -2125,6 +2125,9 @@ async def get_token(contract: str, force: bool = False, max_age: float | None = 
         except Exception as _edge_local_err:
             logger.debug("edge local annotate: %s", _edge_local_err)
 
+        previous = _token_cache.get(contract)
+        prev_data = previous.get("data") if isinstance(previous, dict) else None
+        carry_curve_fields(result, prev_data if isinstance(prev_data, dict) else None)
         _token_cache[contract] = {"data": result, "ts": _time.time()}
         return result
     except Exception as e:
@@ -3283,6 +3286,12 @@ def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reaso
             total_invested_full = h["total_invested"] + cost
         total_returned_full = h.get("total_sold", 0.0)    # all proceeds including this sell
         realized_full = round(float(h.get("realized_total") if h.get("realized_total") is not None else realized), 4)
+        entry_fees = float(h.get("entry_fees") or 0.0)
+        sell_fees = float(h.get("total_fees_paid") or 0.0)
+        if entry_fees:
+            # Entry fees left cash at the buy and were not in the sell-leg PnL.
+            realized_full = round(realized_full - entry_fees, 4)
+            ud["realized_pnl"] = round(float(ud.get("realized_pnl") or 0.0) - entry_fees, 4)
         # Blended x = total money out / total money in
         x_val = round(total_returned_full / total_invested_full, 4) if total_invested_full > 0 else 0
         trade_log.setdefault(uid, []).append({
@@ -3305,7 +3314,7 @@ def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reaso
             "planned":       h.get("planned", True),
             "followed_plan": h.get("followed_plan", None),
             "auto_saved":    auto_saved,
-            "fees_paid":     round(h.get("total_fees_paid", 0.0), 4),
+            "fees_paid":     round(sell_fees + entry_fees, 4),
         })
         del ud["holdings"][contract]
         closed = True
@@ -5005,6 +5014,123 @@ def buy_done_kb(contract: str) -> InlineKeyboardMarkup:
     ])
 
 
+# A single DexScreener print this far from the last confirmed price is not
+# acted on until a second sample agrees, the median of the last 3 has moved
+# with it, or GeckoTerminal prints the same price.
+PRICE_OUTLIER_PCT = 0.40
+_price_confirm: dict = {}
+
+
+def _median(values: list[float]) -> float:
+    ys = sorted(values)
+    n = len(ys)
+    mid = n // 2
+    if n % 2:
+        return ys[mid]
+    return (ys[mid - 1] + ys[mid]) / 2.0
+
+
+def confirmed_price(contract: str, quote: float, now: float | None = None, baseline: float | None = None) -> float:
+    """Price safe for dump alerts, exit-plan invalidation, and APEX stops.
+
+    The first print is confirmed. A later print that jumps more than
+    PRICE_OUTLIER_PCT is withheld until another sample at least a second
+    later agrees within 15%, or the median of the last three samples has
+    moved with it. A same-cycle re-read does not count as that second print.
+    """
+    try:
+        quote = float(quote)
+    except (TypeError, ValueError):
+        return quote
+    if not contract or quote <= 0:
+        return quote
+    import time as _pt
+    now = _pt.time() if now is None else float(now)
+    slot = _price_confirm.setdefault(contract, {"confirmed": None, "pending": None, "samples": []})
+    samples = slot["samples"]
+    if samples and now - samples[-1][0] < 0.5 and abs(samples[-1][1] - quote) / quote < 0.01:
+        confirmed = slot.get("confirmed")
+        return float(confirmed) if confirmed else quote
+    samples.append((now, quote))
+    slot["samples"] = [(t, p) for t, p in samples if now - t <= 180][-5:]
+    samples = slot["samples"]
+    confirmed = slot.get("confirmed")
+    if not confirmed or confirmed <= 0:
+        if baseline and baseline > 0 and abs(quote - baseline) / baseline > PRICE_OUTLIER_PCT:
+            slot["confirmed"] = float(baseline)
+            slot["pending"] = (now, quote)
+            return float(baseline)
+        slot["confirmed"] = quote
+        slot["pending"] = None
+        return quote
+    if abs(quote - confirmed) / confirmed <= PRICE_OUTLIER_PCT:
+        slot["confirmed"] = quote
+        slot["pending"] = None
+        return quote
+    pending = slot.get("pending")
+    agrees = False
+    if pending and now - pending[0] >= 1.0 and pending[1] > 0 and abs(quote - pending[1]) / pending[1] <= 0.15:
+        agrees = True
+    if not agrees and len(samples) >= 3:
+        med = _median([p for _, p in samples[-3:]])
+        if med > 0 and abs(quote - med) / med <= 0.15 and abs(med - confirmed) / confirmed > PRICE_OUTLIER_PCT:
+            quote = med
+            agrees = True
+    if agrees:
+        slot["confirmed"] = float(quote)
+        slot["pending"] = None
+        return float(quote)
+    slot["pending"] = (now, quote)
+    return float(confirmed)
+
+
+async def _gecko_token_price(contract: str, chain: str = "solana") -> float | None:
+    """GeckoTerminal spot, used only to confirm an outlier tick. None on any failure."""
+    network = {
+        "solana": "solana", "sol": "solana",
+        "ethereum": "eth", "eth": "eth",
+        "base": "base", "bsc": "bsc",
+    }.get((chain or "solana").lower(), "solana")
+    try:
+        client = await get_http()
+        r = await client.get(
+            f"https://api.geckoterminal.com/api/v2/simple/networks/{network}/token_price/{contract}",
+            headers={"Accept": "application/json"},
+            timeout=4,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        prices = ((data.get("data") or {}).get("attributes") or {}).get("token_prices") or {}
+        raw = None
+        if isinstance(prices, dict):
+            raw = prices.get(contract) or prices.get(contract.lower())
+            if raw is None and prices:
+                raw = next(iter(prices.values()))
+        val = float(raw)
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
+async def confirmed_price_checked(contract: str, quote: float, chain: str = "solana", baseline: float | None = None) -> float:
+    """confirmed_price, plus a GeckoTerminal cross-check when the tick was withheld."""
+    try:
+        quote_f = float(quote)
+    except (TypeError, ValueError):
+        return quote
+    held = confirmed_price(contract, quote_f, baseline=baseline)
+    if quote_f <= 0 or held <= 0 or abs(quote_f - held) / held <= PRICE_OUTLIER_PCT:
+        return held
+    gecko = await _gecko_token_price(contract, chain)
+    if gecko and abs(quote_f - gecko) / gecko <= 0.20:
+        slot = _price_confirm.setdefault(contract, {"confirmed": None, "pending": None, "samples": []})
+        slot["confirmed"] = quote_f
+        slot["pending"] = None
+        return quote_f
+    return held
+
+
 async def run_checker(app: Application):
     import time as _time_local
 
@@ -5175,7 +5301,11 @@ async def run_checker(app: Application):
             info = await get_token(contract)
             if not info:
                 continue
-            price = info["price"]
+            _hist_px = [p.get("price") for p in (h.get("price_history") or []) if isinstance(p, dict) and p.get("price")]
+            _base_px = _hist_px[-1] if _hist_px else h.get("avg_price")
+            price = await confirmed_price_checked(
+                contract, info["price"], info.get("chain") or "solana", baseline=_base_px,
+            )
             avg = h.get("avg_price", price)
             cx = price / avg if avg > 0 else 0
 
@@ -5361,7 +5491,11 @@ async def run_checker(app: Application):
                 hi = await get_token(hca)
                 if not hi:
                     continue
-                cur_price = hi["price"]
+                _hist_px = [p.get("price") for p in (h.get("price_history") or []) if isinstance(p, dict) and p.get("price")]
+                _base_px = _hist_px[-1] if _hist_px else h.get("avg_price")
+                cur_price = await confirmed_price_checked(
+                    hca, hi["price"], hi.get("chain") or "solana", baseline=_base_px,
+                )
 
                 # Update peak price for replay
                 if cur_price > h.get("peak_price", 0):
@@ -6013,30 +6147,84 @@ async def _dca_show_plan(q, contract: str, p: dict):
     )
 
 
-# pump.fun v3 accepts created_timestamp (not creation_time). Amounts are lamports
-# and raw token units (6 decimals). total_supply on a standard coin is 1e15.
+# pump.fun v3 accepts created_timestamp (not creation_time). Amounts are raw
+# token units (6 decimals). total_supply on a standard coin is 1e15.
+# virtual_sol_reserves is quote-token units (SOL lamports, or 6/8/12 decimals
+# on a non-SOL quote), so curve progress is read from real_token_reserves.
 PUMPFUN_COINS_PARAMS = {"offset": 0, "limit": 50, "sort": "created_timestamp", "order": "DESC"}
 PUMPFUN_COIN_HOSTS = (
     "https://frontend-api-v3.pump.fun/coins",
     "https://frontend-api.pump.fun/coins",
 )
+# Single-coin reads: /coins/<mint> is 404 on v3. /coins-v2/<mint> is the live path.
+PUMPFUN_MINT_URLS = (
+    "https://frontend-api-v3.pump.fun/coins-v2/",
+    "https://frontend-api-v3.pump.fun/coins/",
+    "https://frontend-api.pump.fun/coins-v2/",
+    "https://frontend-api.pump.fun/coins/",
+)
 _PF_SOL_LAMPORTS = 1_000_000_000
 _PF_TOKEN_SUPPLY = 1_000_000_000_000_000  # 1e9 tokens × 1e6 decimals
+# Initial real token reserves on the pump.fun bonding curve (793.1e12 raw units).
+# Progress = tokens sold / this constant. Confirmed against the program constant
+# INITIAL_REAL_TOKEN_RESERVES = 793_100_000_000_000.
+_PF_INITIAL_REAL_TOKENS = 793_100_000_000_000
+_CURVE_STICKY = (
+    "virtual_sol_reserves",
+    "pf_virtual_sol_lamports",
+    "real_token_reserves",
+    "quote_decimals",
+    "pf_curve",
+    "pf_replies",
+    "pf_dev_pct",
+)
 
 
 def pumpfun_curve_pct(coin: dict) -> float:
-    """Bonding-curve progress. virtual_sol_reserves is lamports; 30→55 SOL is the band."""
-    graduated = bool(coin.get("raydium_pool")) or bool(coin.get("complete"))
-    if graduated:
+    """Bonding-curve progress from real token reserves, not quote units.
+
+    complete / a Raydium pool is 100%. Otherwise
+    (1 - real_token_reserves / 793.1e12) * 100, capped under 100 so a fat
+    SOL reserve (126–132 SOL is still on the curve) cannot read as graduated.
+    """
+    if not isinstance(coin, dict):
+        return 0.0
+    if bool(coin.get("complete")) or bool(coin.get("raydium_pool")):
         return 100.0
+    raw = coin.get("real_token_reserves")
+    if raw is None:
+        return 0.0
     try:
-        v_sol = float(coin.get("virtual_sol_reserves") or 0) / _PF_SOL_LAMPORTS
+        real = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    initial, grad = 30.0, 55.0
-    if v_sol <= initial:
+    if real < 0 or _PF_INITIAL_REAL_TOKENS <= 0:
         return 0.0
-    return round(min(max((v_sol - initial) / (grad - initial) * 100, 0), 100), 1)
+    pct = (1.0 - real / _PF_INITIAL_REAL_TOKENS) * 100.0
+    pct = min(max(pct, 0.0), 99.9)
+    return round(pct, 1)
+
+
+def carry_curve_fields(fresh: dict, previous: dict | None) -> dict:
+    """Keep bonding-curve reserves across a DexScreener refetch.
+
+    get_token rebuilds the cache dict and does not know pump.fun fields the
+    feed just attached. A later fill would otherwise see liq 0 and no reserve.
+    """
+    if not isinstance(fresh, dict) or not isinstance(previous, dict):
+        return fresh
+    for key in _CURVE_STICKY:
+        old = previous.get(key)
+        if old in (None, "", 0, 0.0):
+            continue
+        cur = fresh.get(key)
+        if cur in (None, "", 0, 0.0):
+            fresh[key] = old
+    if previous.get("pf_curve") is not None and fresh.get("pf_curve") is None:
+        fresh["pf_curve"] = previous["pf_curve"]
+    if previous.get("pf_graduated") and not fresh.get("pf_graduated"):
+        fresh["pf_graduated"] = True
+    return fresh
 
 
 def pumpfun_dev_pct(coin: dict) -> float | None:
@@ -6123,6 +6311,8 @@ async def sniper_scan() -> list:
                             "_pf_graduated":graduated,
                             "_pf_dev_pct":  pumpfun_dev_pct(coin),
                             "_pf_virtual_sol_lamports": v_lamports,
+                            "_pf_real_token_reserves": coin.get("real_token_reserves"),
+                            "_pf_quote_decimals": coin.get("quote_decimals"),
                             "_pf_name":     coin.get("name", ""),
                             "_pf_symbol":   coin.get("symbol", ""),
                             "_pf_twitter":  coin.get("twitter", ""),
@@ -7651,6 +7841,13 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
                 info["pf_replies"]   = item.get("_pf_replies", 0)
                 info["pf_graduated"] = item.get("_pf_graduated", False)
                 info["pf_dev_pct"]   = item.get("_pf_dev_pct")
+                if item.get("_pf_virtual_sol_lamports"):
+                    info["virtual_sol_reserves"] = item["_pf_virtual_sol_lamports"]
+                    info["pf_virtual_sol_lamports"] = item["_pf_virtual_sol_lamports"]
+                if item.get("_pf_real_token_reserves") is not None:
+                    info["real_token_reserves"] = item["_pf_real_token_reserves"]
+                if item.get("_pf_quote_decimals") is not None:
+                    info["quote_decimals"] = item["_pf_quote_decimals"]
                 info["boost_amount"] = item.get("_boost_amount", 0)
                 # Override socials from pump.fun if DexScreener has none
                 if not info.get("twitter")  and item.get("_pf_twitter"):
@@ -9624,7 +9821,12 @@ async def apex_run_position_manager(app, uid: int, ud: dict, positions_due: list
                 info["age_h"]       = _nf(info.get("age_h"), 0.0)
                 info["liq_pct"]     = _nf(info.get("liq_pct"), 0.0)
 
-                price = info["price"]
+                _hist_px = [p.get("price") for p in (h.get("price_history") or []) if isinstance(p, dict) and p.get("price")]
+                _base_px = _hist_px[-1] if _hist_px else h.get("avg_price")
+                price = await confirmed_price_checked(
+                    contract, info["price"], info.get("chain") or "solana", baseline=_base_px,
+                )
+                info["price"] = price
                 avg   = h.get("avg_price", price)
                 if avg <= 0:
                     continue
@@ -12288,26 +12490,61 @@ def _build_meta_prompt_block(info: dict) -> str:
     return "\n".join(lines)
 
 
-async def bonding_curve_quote_usd(info: dict | None, contract: str) -> float | None:
-    """USD value of pump.fun virtual SOL reserves (quote side), or None.
+def _apply_pumpfun_coin(info: dict | None, coin: dict) -> None:
+    """Copy curve reserves onto the cached token dict."""
+    if not isinstance(info, dict) or not isinstance(coin, dict):
+        return
+    raw = coin.get("virtual_sol_reserves")
+    if raw:
+        info["virtual_sol_reserves"] = raw
+        info["pf_virtual_sol_lamports"] = raw
+    if coin.get("real_token_reserves") is not None:
+        info["real_token_reserves"] = coin.get("real_token_reserves")
+    if coin.get("quote_decimals") is not None:
+        info["quote_decimals"] = coin.get("quote_decimals")
+    info["pf_curve"] = pumpfun_curve_pct(coin)
+    if coin.get("complete") or coin.get("raydium_pool"):
+        info["pf_graduated"] = True
 
-    The coins API returns lamports. Used only when DexScreener liquidity is
-    missing so a bonding-curve paper buy can still estimate slippage.
+
+async def bonding_curve_quote_usd(info: dict | None, contract: str) -> float | None:
+    """USD value of the pump.fun quote-side reserve, or None.
+
+    SOL reserves are lamports (9 decimals). Other quotes use quote_decimals
+    and are not priced as SOL. Used when DexScreener liquidity is missing so
+    a bonding-curve paper buy can still estimate slippage.
     """
     raw = None
+    decimals = 9
     if info:
         raw = info.get("virtual_sol_reserves")
         if raw is None:
             raw = info.get("pf_virtual_sol_lamports")
+        if info.get("quote_decimals") is not None:
+            try:
+                decimals = int(info.get("quote_decimals"))
+            except (TypeError, ValueError):
+                decimals = 9
     if raw is None and contract:
-        raw = await _fetch_pumpfun_virtual_sol(contract)
+        coin = await _fetch_pumpfun_coin(contract)
+        if coin:
+            _apply_pumpfun_coin(info, coin)
+            raw = coin.get("virtual_sol_reserves")
+            if coin.get("quote_decimals") is not None:
+                try:
+                    decimals = int(coin.get("quote_decimals"))
+                except (TypeError, ValueError):
+                    decimals = 9
     try:
-        lamports = float(raw)
+        units_raw = float(raw)
     except (TypeError, ValueError):
         return None
-    if lamports <= 0:
+    if units_raw <= 0:
         return None
-    sol = lamports / _PF_SOL_LAMPORTS
+    # Non-SOL quotes are not converted at the SOL price.
+    if decimals != 9:
+        return None
+    sol = units_raw / _PF_SOL_LAMPORTS
     try:
         sol_usd = float(await get_sol_price() or 0)
     except Exception:
@@ -12317,23 +12554,47 @@ async def bonding_curve_quote_usd(info: dict | None, contract: str) -> float | N
     return sol * sol_usd
 
 
-async def _fetch_pumpfun_virtual_sol(mint: str) -> float | None:
+async def _fetch_pumpfun_coin(mint: str) -> dict | None:
+    """GET /coins-v2/<mint>, then older /coins/<mint> paths. 404 and 5xx skip."""
+    if not mint:
+        return None
     try:
         client = await get_http()
-        r = await client.get(
-            "https://frontend-api-v3.pump.fun/coins/" + mint,
-            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-            timeout=6,
-        )
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not isinstance(data, dict):
-            return None
-        val = float(data.get("virtual_sol_reserves") or 0)
-        return val or None
     except Exception:
         return None
+    for base in PUMPFUN_MINT_URLS:
+        try:
+            r = await client.get(
+                base + mint,
+                headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+                timeout=6,
+            )
+        except Exception:
+            continue
+        if r.status_code == 404 or _pumpfun_host_unusable(r.status_code):
+            continue
+        if r.status_code != 200:
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        if isinstance(data, dict) and (
+            data.get("mint") or data.get("virtual_sol_reserves") is not None or data.get("real_token_reserves") is not None
+        ):
+            return data
+    return None
+
+
+async def _fetch_pumpfun_virtual_sol(mint: str) -> float | None:
+    coin = await _fetch_pumpfun_coin(mint)
+    if not coin:
+        return None
+    try:
+        val = float(coin.get("virtual_sol_reserves") or 0)
+    except (TypeError, ValueError):
+        return None
+    return val or None
 
 
 async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, planned: bool = True, mood: str = "", vault_buy: bool = False, exit_plan: dict | None = None) -> str | tuple:

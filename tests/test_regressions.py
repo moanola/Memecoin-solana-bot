@@ -12,10 +12,17 @@ from edge.quotes import annotate_dex_pair
 def test_bonding_curve_uses_lamports_and_dev_pct_is_unknown_without_field():
     import sol_trading_bot as bot
 
-    # 42.5 SOL in lamports sits halfway from 30 to 55.
-    assert bot.pumpfun_curve_pct({"virtual_sol_reserves": 42_500_000_000}) == 50.0
-    assert bot.pumpfun_curve_pct({"virtual_sol_reserves": 30_000_000_000}) == 0.0
+    half = bot._PF_INITIAL_REAL_TOKENS / 2
+    assert bot.pumpfun_curve_pct({"real_token_reserves": half}) == 50.0
+    assert bot.pumpfun_curve_pct({"real_token_reserves": bot._PF_INITIAL_REAL_TOKENS}) == 0.0
     assert bot.pumpfun_curve_pct({"complete": True, "virtual_sol_reserves": 1}) == 100.0
+    # Quote units are not a SOL band. 130 SOL still on the curve is not 100%.
+    assert bot.pumpfun_curve_pct({"virtual_sol_reserves": 130_000_000_000, "complete": False}) < 100
+    assert bot.pumpfun_curve_pct({
+        "virtual_sol_reserves": 42_500_000_000,
+        "quote_decimals": 6,
+        "real_token_reserves": bot._PF_INITIAL_REAL_TOKENS * 0.8,
+    }) == 20.0
     # v3 omits creator holdings. 0% would be a lie.
     assert bot.pumpfun_dev_pct({"total_supply": 1_000_000_000_000_000}) is None
     # Raw units, 6 decimals, supply 1e15 → 10%.
@@ -83,6 +90,7 @@ async def test_pumpfun_v3_list_parses_curve(monkeypatch):
                 return Resp(200, [{
                     "mint": "MintPump111111111111111111111111111111",
                     "virtual_sol_reserves": 42_500_000_000,
+                    "real_token_reserves": bot._PF_INITIAL_REAL_TOKENS / 2,
                     "reply_count": 4,
                     "twitter": "https://x.com/coin",
                     "name": "Coin",
@@ -292,3 +300,128 @@ def test_apex_heat_uses_vault_not_main_balance():
     }
     # 20 / (80 + 20) = 20%. The $5,000 cash balance must not dilute this to ~0.
     assert bot.apex_capital_heat(ud) == pytest.approx(0.20)
+
+
+def test_curve_fields_survive_a_refetch_and_scores_match():
+    import sol_trading_bot as bot
+
+    previous = {
+        "pf_curve": 40.0,
+        "virtual_sol_reserves": 40_000_000_000,
+        "pf_virtual_sol_lamports": 40_000_000_000,
+        "pf_replies": 12,
+    }
+    fresh = {"pf_curve": None, "virtual_sol_reserves": None, "liq": 1_200, "price": 0.00001}
+    bot.carry_curve_fields(fresh, previous)
+    assert fresh["pf_curve"] == 40.0
+    assert fresh["virtual_sol_reserves"] == 40_000_000_000
+    base = {
+        "symbol": "EGG", "name": "Egg", "chain": "solana", "price": 0.00001,
+        "mc": 40_000, "liq": 1_200, "liq_pct": 3, "age_h": 0.8,
+        "buy_pct": 60, "buy_pct_h1": 60, "buy_pct_m5": 55,
+        "buys": 80, "sells": 40, "buys_h1": 40, "sells_h1": 20,
+        "buys_m5": 10, "sells_m5": 5,
+        "vol_h1": 8_000, "vol_m5": 1_000, "vol_h24": 20_000,
+        "ch_m5": 2, "ch_h1": 5, "twitter": "https://x.com/e",
+        "no_mint": True, "no_freeze": True, "lp_burn": 100,
+        "top10_pct": 20, "pf_replies": 12, "pf_graduated": False, "rug_risks": [],
+    }
+    with_curve = dict(base, pf_curve=40.0)
+    without = dict(base, pf_curve=None)
+    scored = bot.sniper_score(with_curve)["score"]
+    assert bot.sniper_score(without)["score"] != scored
+    restored = dict(without)
+    bot.carry_curve_fields(restored, with_curve)
+    assert bot.sniper_score(restored)["score"] == scored
+
+
+async def test_pumpfun_mint_uses_coins_v2(monkeypatch):
+    import sol_trading_bot as bot
+
+    class Resp:
+        def __init__(self, status, body):
+            self.status_code = status
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    calls = []
+
+    class Client:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            calls.append(url)
+            if url.endswith("/coins-v2/MintCurve"):
+                return Resp(200, {"mint": "MintCurve", "virtual_sol_reserves": 40_000_000_000, "real_token_reserves": 1})
+            return Resp(404, {})
+
+    async def fake_http():
+        return Client()
+
+    monkeypatch.setattr(bot, "get_http", fake_http)
+    coin = await bot._fetch_pumpfun_coin("MintCurve")
+    assert coin["virtual_sol_reserves"] == 40_000_000_000
+    assert calls[0].endswith("/coins-v2/MintCurve")
+    assert "/coins/MintCurve" not in calls[0]
+
+
+def test_outlier_tick_does_not_invalidate_until_confirmed():
+    import sol_trading_bot as bot
+    from edge.exit_plan import evaluate, resolve_plan
+
+    bot._price_confirm.pop("WIF", None)
+    assert bot.confirmed_price("WIF", 6.2e-05, now=1_000) == pytest.approx(6.2e-05)
+    held = bot.confirmed_price("WIF", 1.838e-05, now=1_010)
+    assert held == pytest.approx(6.2e-05)
+    plan = resolve_plan({"preset": "standard"})
+    holding = {"avg_price": 6.2e-05, "bought_at": datetime.now()}
+    assert evaluate(plan, holding, 1.838e-05) == "invalidation"
+    assert evaluate(plan, holding, held) is None
+    # A second print a second later, in the same neighbourhood, confirms the move.
+    assert bot.confirmed_price("WIF", 1.80e-05, now=1_012) == pytest.approx(1.80e-05)
+    bot._price_confirm.pop("WIF", None)
+
+
+async def test_gecko_can_confirm_an_outlier(monkeypatch):
+    import sol_trading_bot as bot
+
+    bot._price_confirm.pop("WIF", None)
+    bot.confirmed_price("WIF", 6.2e-05, now=2_000)
+
+    async def gecko(contract, chain="solana"):
+        return 1.84e-05
+
+    monkeypatch.setattr(bot, "_gecko_token_price", gecko)
+    confirmed = await bot.confirmed_price_checked("WIF", 1.838e-05)
+    assert confirmed == pytest.approx(1.838e-05)
+    bot._price_confirm.pop("WIF", None)
+
+
+def test_closed_history_includes_entry_fees(monkeypatch):
+    import sol_trading_bot as bot
+
+    monkeypatch.setattr(bot, "save_user", lambda *a, **k: None)
+    monkeypatch.setattr(bot, "save_trade_log", lambda *a, **k: None)
+    uid = 991004
+    bot.users.pop(uid, None)
+    bot.trade_log.pop(uid, None)
+    ud = bot.get_user(uid, "fees")
+    ud["balance"] = 0.0
+    ud["realized_pnl"] = 0.0
+    ud["holdings"]["Mint"] = {
+        "symbol": "DOG", "name": "Dog", "chain": "solana",
+        "amount": 100.0, "avg_price": 1.0,
+        "total_invested": 100.0, "buy_cost": 100.0,
+        "total_sold": 0.0, "realized_total": 0.0,
+        "entry_fees": 1.25, "total_fees_paid": 0.0,
+        "bought_at": datetime.now(), "mood": "", "auto_sells": [],
+    }
+    try:
+        bot.sell_core(ud, uid, "Mint", 100.0, 1.0, "manual", liq=1_000_000)
+        log = bot.trade_log[uid][0]
+        assert log["fees_paid"] >= 1.25
+        assert log["realized_pnl"] == pytest.approx(ud["realized_pnl"], abs=0.02)
+        assert log["realized_pnl"] < log["returned"] - log["invested"]
+    finally:
+        bot.users.pop(uid, None)
+        bot.trade_log.pop(uid, None)

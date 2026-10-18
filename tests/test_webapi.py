@@ -375,3 +375,86 @@ async def test_concurrent_feed_refresh_is_one_scan(api, monkeypatch):
     )
     assert a.status_code == 200 and b.status_code == 200
     assert calls["n"] == 1
+
+
+async def test_equity_includes_vault_and_open_partials(api):
+    client, _prices = api
+    ud = _user(balance=900)
+    ud["apex_vault"] = 80.0
+    ud["savings"] = 10.0
+    ud["realized_pnl"] = -8.0
+    ud["holdings"] = {
+        MINT: {
+            "symbol": "PEPE", "amount": 100, "total_invested": 10,
+            "avg_price": 0.1, "mood": "APEX", "realized_total": -3.0,
+        },
+    }
+    bot.users[UID] = ud
+    bot.trade_log[UID] = [
+        {"symbol": "A", "realized_pnl": -5, "closed_at": "2026-01-01T00:00:00Z"},
+    ]
+    bot._token_cache[MINT] = {"ts": time.time(), "data": {"price": 0.5}}
+    me = (await client.get("/api/me", headers=_headers())).json()
+    # 900 cash + 10 savings + 80 vault + 50 live mark
+    assert me["equity"] == pytest.approx(1040, abs=0.05)
+    board = await client.get("/api/leaderboard?sort=equity", headers=_headers())
+    row = next(r for r in board.json()["rows"] if r["is_me"])
+    assert row["equity"] == pytest.approx(1040, abs=0.05)
+    # Closed log is -5. The open partial (-3) is in the header and on the board.
+    assert row["pnl"] == pytest.approx(-8, abs=0.05)
+
+
+async def test_zero_liq_hides_slippage_preview(api, monkeypatch):
+    client, _prices = api
+    bot.users[UID] = _user()
+
+    async def zero(contract, force=False, max_age=None):
+        return {
+            "symbol": "Z", "name": "Zero", "chain": "solana", "price": 1e-6,
+            "mc": 1_000, "liq": 0, "pair_addr": "p", "dex": "pumpfun",
+            "age_h": 0.2, "buy_pct": 50, "rug_risks": [],
+        }
+
+    async def no_coin(_mint):
+        return None
+
+    monkeypatch.setattr(bot, "get_token", zero)
+    monkeypatch.setattr(bot, "_fetch_pumpfun_coin", no_coin)
+    detail = await client.get(f"/api/tokens/{MINT}", headers=_headers())
+    assert detail.status_code == 200
+    assert detail.json()["slippage"] is None
+
+
+async def test_feed_skips_pairless_pumpfun(api, monkeypatch):
+    client, _prices = api
+    bot.users[UID] = _user()
+    pumps = [
+        {"tokenAddress": f"PUMP{i:02d}xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "source": "pumpfun", "_pf_curve": 20}
+        for i in range(30)
+    ]
+    pairs = [
+        {"tokenAddress": f"PAIR{i:02d}yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "source": "dexscreener"}
+        for i in range(5)
+    ]
+
+    async def scan():
+        return pumps + pairs
+
+    async def gt(contract, force=False, max_age=None):
+        if str(contract).startswith("PAIR"):
+            return {
+                "symbol": "P", "name": "P", "chain": "solana", "price": 0.01,
+                "mc": 20_000, "liq": 8_000, "pair_addr": "px", "dex": "raydium",
+                "age_h": 1, "buy_pct": 55, "rug_risks": [],
+            }
+        return None
+
+    monkeypatch.setattr(bot, "sniper_scan", scan)
+    monkeypatch.setattr(bot, "get_token", gt)
+    webapi._feed.clear()
+    webapi._feed_refresh_task = None
+    res = await client.get("/api/feed?refresh=true", headers=_headers())
+    assert res.status_code == 200
+    tokens = res.json()["tokens"]
+    assert len(tokens) == 5
+    assert all(t["contract"].startswith("PAIR") for t in tokens)

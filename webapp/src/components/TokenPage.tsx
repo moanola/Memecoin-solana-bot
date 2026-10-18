@@ -213,11 +213,13 @@ export function TokenPage({
       <div className="card p-3 space-y-3">
         <div className="flex items-center justify-between">
           <span className="text-[11px] tracking-[0.16em] uppercase text-mute">Paper buy</span>
-          {token.slippage && (
+          {token.slippage ? (
             <span className="text-[11px] text-mute num">
               slip {token.slippage.slippage_pct}% on {money(token.slippage.sample_usd)}
             </span>
-          )}
+          ) : !token.liq || token.liq <= 0 ? (
+            <span className="text-[11px] text-loss">No pool liquidity</span>
+          ) : null}
         </div>
         <div className="grid grid-cols-4 gap-2">
           {PRESETS.map((n) => (

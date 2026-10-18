@@ -71,6 +71,7 @@ export function Positions({
           </div>
           <div className="text-xs text-mute num mt-1">
             {(t.x ?? 0).toFixed(2)}x · {holdTime(t.hold_h)} · {exitReason(t.reason)}
+            {t.fees_paid ? ` · fees ${money(t.fees_paid)}` : ""}
           </div>
         </div>
       ))}
