@@ -211,7 +211,7 @@ _apex_rejected:  dict = {}
 _user_locks:        dict = {}  # asyncio.Lock per uid — prevents concurrent buy/sell
 
 
-from persistence import load_all, save_user, save_trade_log, autosave_job
+from persistence import load_all, save_user, save_trade_log, autosave_job, register_state
 _http: httpx.AsyncClient | None = None
 
 async def get_http() -> httpx.AsyncClient:
@@ -19666,6 +19666,18 @@ async def dump_log_drain_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             logger.debug(f"Dump log drain: {sent} sent for uid={uid}, {len(queue)} remaining")
 
 
+def _register_persistence_state() -> None:
+    register_state(
+        users, trade_log,
+        extras={
+            "_persisted_watchlist":     _apex_watchlist,
+            "_persisted_post_exit":     _apex_post_exit,
+            "_persisted_channel_calls": _channel_calls,
+            "_persisted_rejected":      _apex_rejected,
+        },
+    )
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -19698,6 +19710,10 @@ def main():
             if _ud2.get("apex_mode"):
                 apex_self_calibrate(_ud2, _uid2, suggest_only=False)
     app.job_queue.run_daily(_apex_midnight_calibrate, time=__import__("datetime").time(0, 5))
+
+    # Hand persistence references to the live state (it must never import this
+    # module: under `python sol_trading_bot.py` that creates a second, empty copy).
+    _register_persistence_state()
 
     # Load all persisted user data before starting
     load_all(users, trade_log)

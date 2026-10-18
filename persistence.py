@@ -18,18 +18,30 @@ SETUP (one time):
            updated BIGINT  NOT NULL
        );
 
+       ALTER TABLE bot_users     ENABLE ROW LEVEL SECURITY;
+       ALTER TABLE bot_trade_log ENABLE ROW LEVEL SECURITY;
+       -- No policies are created: anon/authenticated roles get no access.
+       -- The service_role key bypasses RLS, so only this server can read/write.
+
   3. Project → Settings → API
-     Copy "Project URL" and "anon public" key
+     Copy "Project URL" and the "service_role" secret key.
+     Keep it server-side only (Railway Variables) — never in the repo or a client.
   4. Railway → your service → Variables:
        SUPABASE_URL  = https://xxxx.supabase.co
-       SUPABASE_KEY  = your-anon-public-key
+       SUPABASE_KEY  = your-service-role-key
 
-No Volume needed.
+No Volume needed. See README.md for details.
+
+Live state is registered by the bot via register_state() — this module never
+imports sol_trading_bot (doing so from `python sol_trading_bot.py` created a
+second, empty copy of the module, so autosave saw no users).
 """
 
+import itertools
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, date
 
@@ -149,7 +161,26 @@ def _sb_all(table: str) -> list:
     return results
 
 
+class _ClosingConn:
+    """sqlite3's own context manager commits but never closes — this does both."""
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self.conn.__enter__()
+
+    def __exit__(self, *exc):
+        try:
+            return self.conn.__exit__(*exc)
+        finally:
+            self.conn.close()
+
+
 def _sqlite_conn():
+    return _ClosingConn(_sqlite_raw_conn())
+
+
+def _sqlite_raw_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # WAL mode: allows concurrent reads + one writer without "database is locked"
@@ -205,62 +236,87 @@ def load_all(users: dict, trade_log: dict):
     logger.info("Loaded %d users (%s)", loaded, "sqlite" if _USE_SQLITE else "supabase")
 
 
-def _save_user_sync(uid: int, ud: dict):
-    """Synchronous save — call via asyncio.to_thread from async context."""
+# ── Ordering guard ───────────────────────────────────────────────────────────
+# Writes run on a thread pool, so two snapshots of the same uid could finish
+# out of order. Each snapshot gets a sequence number; a write is skipped if a
+# newer snapshot for that key has already been written.
+_seq = itertools.count(1)
+_last_written: dict = {}
+_write_lock = threading.Lock()
+
+
+def _write_user(uid: int, data_str: str) -> None:
+    if _USE_SQLITE:
+        with _sqlite_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO users (uid, data, updated) VALUES (?, ?, ?)",
+                (uid, data_str, time.time())
+            )
+    else:
+        _sb_upsert("bot_users", uid, data_str)
+
+
+def _write_trade_log(uid: int, data_str: str) -> None:
+    if _USE_SQLITE:
+        with _sqlite_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO trade_log (uid, data, updated) VALUES (?, ?, ?)",
+                (uid, data_str, time.time())
+            )
+    else:
+        _sb_upsert("bot_trade_log", uid, data_str)
+
+
+def _ordered_write(kind: str, uid: int, seq: int, data_str: str) -> None:
+    """Run in a worker thread. data_str is an immutable snapshot."""
+    key = (kind, uid)
     try:
-        data_str = _dumps(ud)
-        if _USE_SQLITE:
-            with _sqlite_conn() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO users (uid, data, updated) VALUES (?, ?, ?)",
-                    (uid, data_str, time.time())
-                )
-        else:
-            _sb_upsert("bot_users", uid, data_str)
+        with _write_lock:
+            if _last_written.get(key, 0) > seq:
+                return  # a newer snapshot already landed
+        (_write_user if kind == "user" else _write_trade_log)(uid, data_str)
+        with _write_lock:
+            if _last_written.get(key, 0) < seq:
+                _last_written[key] = seq
     except Exception as e:
-        logger.error("save_user(%s): %s", uid, e)
+        logger.error("save_%s(%s): %s", kind, uid, e)
+
+
+def _schedule(kind: str, uid: int, obj) -> None:
+    """
+    Snapshot obj NOW (on the calling thread / event loop) by serialising it to
+    a JSON string, then hand only that string to the thread pool. The live dict
+    can keep changing without corrupting the write or raising
+    "dictionary changed size during iteration" in the worker.
+    """
+    try:
+        data_str = _dumps(obj)
+    except Exception as e:
+        logger.error("save_%s(%s) serialise failed: %s", kind, uid, e)
+        return
+    seq = next(_seq)
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        # No running loop — called from sync context (e.g. startup migration)
+        _ordered_write(kind, uid, seq, data_str)
+    else:
+        # Fire-and-forget: errors are logged in _ordered_write; autosave_job
+        # also re-persists every user periodically.
+        loop.run_in_executor(None, _ordered_write, kind, uid, seq, data_str)
 
 
 def save_user(uid: int, ud: dict):
-    """
-    Non-blocking save. Schedules the sync write on a thread pool so the
-    async event loop is never blocked by network I/O to Supabase.
-    Falls back to direct sync call if no running loop (e.g. at startup).
-    The returned future is intentionally not awaited — fire-and-forget is
-    acceptable here because autosave_job also persists all users every 60s.
-    Errors are surfaced in _save_user_sync via logger.error.
-    """
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, _save_user_sync, uid, ud)
-    except RuntimeError:
-        # No running loop — called from sync context (e.g. load_all at boot)
-        _save_user_sync(uid, ud)
-
-
-def _save_trade_log_sync(uid: int, log: list):
-    try:
-        data_str = _dumps(log)
-        if _USE_SQLITE:
-            with _sqlite_conn() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO trade_log (uid, data, updated) VALUES (?, ?, ?)",
-                    (uid, data_str, time.time())
-                )
-        else:
-            _sb_upsert("bot_trade_log", uid, data_str)
-    except Exception as e:
-        logger.error("save_trade_log(%s): %s", uid, e)
+    """Non-blocking save of a JSON snapshot of ud (taken synchronously)."""
+    _schedule("user", uid, ud)
 
 
 def save_trade_log(uid: int, log: list):
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, _save_trade_log_sync, uid, log)
-    except RuntimeError:
-        _save_trade_log_sync(uid, log)
+    """Non-blocking save of a JSON snapshot of log (taken synchronously)."""
+    _schedule("trade_log", uid, log)
 
 
 def save_all(uid: int, ud: dict, log: list):
@@ -268,25 +324,43 @@ def save_all(uid: int, ud: dict, log: list):
     save_trade_log(uid, log)
 
 
+# ── Live state registry ──────────────────────────────────────────────────────
+# The bot registers references to its in-memory dicts at startup. autosave_job
+# reads these instead of importing sol_trading_bot.
+_state: dict = {
+    "users": None,
+    "trade_log": None,
+    "extras": {},   # persisted key in ud -> runtime dict keyed by uid
+}
+
+
+def register_state(users: dict, trade_log: dict, extras: dict | None = None) -> None:
+    """
+    users / trade_log: the bot's live dicts (uid -> data).
+    extras: {"_persisted_watchlist": _apex_watchlist, ...} — runtime dicts keyed
+    by uid that are copied into ud[key] before each autosave.
+    """
+    _state["users"] = users
+    _state["trade_log"] = trade_log
+    _state["extras"] = dict(extras or {})
+
+
 async def autosave_job(context):
-    import sol_trading_bot as _bot
+    users = _state["users"]
+    trade_log = _state["trade_log"]
+    if users is None:
+        logger.error("autosave_job: register_state() was never called — nothing saved")
+        return
     saved = 0
-    for uid, ud in list(_bot.users.items()):
+    for uid, ud in list(users.items()):
         try:
             # ── Snapshot runtime dicts into ud so they survive restarts ───────
-            # These are in-memory-only by default; writing them to ud means
-            # load_all can restore them on the next boot without any extra table.
-            if uid in _bot._apex_watchlist:
-                ud["_persisted_watchlist"] = _bot._apex_watchlist[uid]
-            if uid in _bot._apex_post_exit:
-                ud["_persisted_post_exit"] = _bot._apex_post_exit[uid]
-            if uid in _bot._channel_calls:
-                ud["_persisted_channel_calls"] = _bot._channel_calls[uid]
-            if uid in _bot._apex_rejected:
-                ud["_persisted_rejected"] = _bot._apex_rejected[uid]
+            for key, runtime in _state["extras"].items():
+                if uid in runtime:
+                    ud[key] = runtime[uid]
             save_user(uid, ud)
-            if uid in _bot.trade_log:
-                save_trade_log(uid, _bot.trade_log[uid])
+            if trade_log is not None and uid in trade_log:
+                save_trade_log(uid, trade_log[uid])
             saved += 1
         except Exception as e:
             logger.error("autosave uid %s: %s", uid, e)
