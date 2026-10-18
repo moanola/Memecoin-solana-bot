@@ -30,25 +30,14 @@ try:
 except ImportError:
     PILLOW_OK = False
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env var not set. Add it in Railway → Variables.")
-
-# ── ADMIN ACCESS ──────────────────────────────────────────────────────────────
-# Set ADMIN_IDS in Railway env vars as comma-separated Telegram user IDs.
-# Example: ADMIN_IDS=123456789,987654321
-_admin_raw = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS: set = {int(x.strip()) for x in _admin_raw.split(",") if x.strip().isdigit()}
-
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
-
-# ── ACCESS CONTROL ────────────────────────────────────────────────────────────
-# When ACCESS_CONTROL_ENABLED=true, new users must be approved by admin.
-# Set ACCESS_ADMIN_USERNAME in Railway env vars (without @), e.g. auracle_x
-# Admins (ADMIN_IDS) are always approved automatically.
-ACCESS_ADMIN_USERNAME   = os.getenv("ACCESS_ADMIN_USERNAME", "auracle_x")
-ACCESS_CONTROL_ENABLED  = os.getenv("ACCESS_CONTROL_ENABLED", "true").lower() == "true"
+# Environment-driven settings live in config.py (BOT_TOKEN, ADMIN_IDS, access
+# control, model id, timezone, simulated trading costs).
+from config import (
+    BOT_TOKEN, ADMIN_IDS, is_admin,
+    ACCESS_ADMIN_USERNAME, ACCESS_CONTROL_ENABLED,
+    ANTHROPIC_MODEL, BOT_TZ, BOT_TIMEZONE_NAME, FILL_MAX_PRICE_AGE_S,
+    SIM_FEES_ENABLED, SIM_GAS_USD, SIM_DEX_FEE_PCT, SIM_SLIPPAGE_PCT, SIM_TOTAL_PCT,
+)
 
 
 # Tracks users waiting for admin approval: uid -> {"name": str, "username": str}
@@ -78,25 +67,7 @@ async def _get_rugcheck_semaphore() -> "_asyncio.Semaphore":
 SNIPER_LOG_MAX = 200          # max sniper log entries per user
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════════════════════
-# SIMULATED TRADING COSTS — mirrors real Solana DEX costs for accurate P&L
-# ══════════════════════════════════════════════════════════════════════════════
-# Every buy and sell deducts these costs so paper trading results match live.
-#
-# Real Solana costs per trade:
-#   Gas (network fee)   : ~$0.002  flat per tx
-#   DEX fee (PumpSwap)  : 0.25%    of trade size (LP fee)
-#   Slippage (micro-cap): 0.5%     avg on thin liq tokens ($10K–$500K MC)
-#   ──────────────────────────────────────────────────────
-#   Total per trade     : ~0.75% + $0.002
-#   Round trip (buy+sell): ~1.5% + $0.004
-#
-# Change SIM_FEES_ENABLED = False to disable for comparison.
-SIM_FEES_ENABLED    = True
-SIM_GAS_USD         = 0.002    # flat SOL network fee per transaction
-SIM_DEX_FEE_PCT     = 0.0025   # 0.25% — PumpSwap/Raydium LP fee
-SIM_SLIPPAGE_PCT    = 0.005    # 0.50% — avg slippage on micro-cap Solana tokens
-SIM_TOTAL_PCT       = SIM_DEX_FEE_PCT + SIM_SLIPPAGE_PCT  # 0.75% per trade
+# SIMULATED TRADING COSTS: see config.py (SIM_*) and slippage.py
 
 # ── APEX Re-entry Watchlist constants ─────────────────────────────────────────
 WATCHLIST_EXPIRY_S    = 43200   # 12h — auto-expire dead/dormant tokens
