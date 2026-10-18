@@ -8,7 +8,7 @@ import { Positions } from "./components/Positions";
 import { TokenPage } from "./components/TokenPage";
 import { money, signed } from "./format";
 import { bootTelegram, tg } from "./telegram";
-import type { FeedToken, Me, Position, Tick, Trade } from "./types";
+import type { FeedToken, MarketMood, Me, Position, Tick, Trade } from "./types";
 
 type Tab = "feed" | "positions" | "apex" | "board";
 
@@ -25,6 +25,7 @@ export function App() {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [tick, setTick] = useState<Tick | null>(null);
   const [install, setInstall] = useState<BeforeInstallPromptEvent | null>(null);
+  const [mood, setMood] = useState<MarketMood | null>(null);
 
   const refreshBook = useCallback(async () => {
     const [pos, hist, who] = await Promise.all([api.positions(), api.history(), api.me()]);
@@ -63,7 +64,11 @@ export function App() {
       .then(async (who) => {
         setMe(who);
         setGate("in");
-        await Promise.all([loadFeed(false), refreshBook()]);
+        await Promise.all([
+          loadFeed(false),
+          refreshBook(),
+          api.mood().then((m) => setMood(m.mood)).catch(() => setMood(null)),
+        ]);
       })
       .catch((err: unknown) => {
         if (err instanceof ApiError && err.status === 403) {
@@ -147,6 +152,11 @@ export function App() {
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold tracking-[0.18em]">APEX</span>
           <span className="chip">Paper</span>
+          {mood && (
+            <span className={`chip ${mood.label === "COLD" ? "text-loss" : mood.label === "HOT" ? "text-gain" : "text-cyan"}`}>
+              {mood.label} {mood.score}
+            </span>
+          )}
         </div>
         <div className="text-right">
           <div className="num text-sm">{money(balance)}</div>
@@ -173,7 +183,13 @@ export function App() {
             quickBuy={me?.quick_buy_amount || 100}
             balanceSet={Boolean(me?.balance_set)}
             onBack={() => setContract(null)}
-            onChanged={() => { void refreshBook(); }}
+            onChanged={(patch) => {
+              if (patch?.balance != null) {
+                setMe((current) => (current ? { ...current, balance: patch.balance ?? current.balance } : current));
+                setTick((current) => (current ? { ...current, balance: patch.balance ?? current.balance } : current));
+              }
+              void refreshBook();
+            }}
           />
         ) : tab === "feed" ? (
           <Feed tokens={tokens} loading={scanning} onOpen={setContract} onRefresh={() => { void loadFeed(true); }} />
@@ -185,14 +201,12 @@ export function App() {
           <Board />
         )}
       </main>
-      {!contract && (
-        <nav className="nav">
-          <Nav id="feed" tab={tab} setTab={setTab} label="Feed" />
-          <Nav id="positions" tab={tab} setTab={setTab} label="Book" />
-          <Nav id="apex" tab={tab} setTab={setTab} label="APEX" />
-          <Nav id="board" tab={tab} setTab={setTab} label="Board" />
-        </nav>
-      )}
+      <nav className="nav">
+        <Nav id="feed" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="Feed" />
+        <Nav id="positions" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="Book" />
+        <Nav id="apex" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="APEX" />
+        <Nav id="board" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="Board" />
+      </nav>
     </div>
   );
 }

@@ -15,11 +15,11 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import sol_trading_bot as bot
 from telegram_auth import (
@@ -34,11 +34,13 @@ logger = logging.getLogger(__name__)
 
 _feed: dict[str, dict] = {}
 _feed_lock = asyncio.Lock()
+_feed_refresh_task: asyncio.Task | None = None
 _last_record_ts = 0.0
 _last_refresh_ts = 0.0
 FEED_CAP = 80
 SCAN_CAP = 24
-FEED_STALE_S = 90
+# sniper_job record_scans every 5 minutes. The old 90s loop started a second
+# full scan and raced that job. The loop below only backfills an empty feed.
 
 
 def _max_age() -> int:
@@ -75,6 +77,23 @@ class LoginBody(BaseModel):
 class BuyBody(BaseModel):
     contract: str = Field(min_length=8, max_length=128)
     amount_usd: float = Field(gt=0, le=10_000)
+    preset: str | None = None
+    tp_x: float | None = None
+    tp_pct: float | None = None
+    invalidation_pct: float | None = None
+    time_stop_min: float | None = None
+
+    @field_validator("preset")
+    @classmethod
+    def _known_preset(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        name = value.strip().lower()
+        if not name:
+            return None
+        if name not in {"scalp", "standard", "runner"}:
+            raise ValueError("Unknown exit preset. Choose scalp, standard, or runner.")
+        return name
 
 
 class SellBody(BaseModel):
@@ -155,7 +174,7 @@ def _public_token(contract: str, info: dict, sc: dict, ai: dict | None = None, s
             "no_mint": info.get("no_mint"),
             "no_freeze": info.get("no_freeze"),
             "lp_burn": info.get("lp_burn"),
-            "top10_pct": info.get("top10_pct"),
+            "top10_pct": (round(float(info["top10_pct"]), 1) if info.get("top10_pct") is not None else None),
             "insider_pct": info.get("insider_pct"),
             "risks": [str(r) for r in rug_risks][:8],
             "rate_limited": bool(info.get("rc_rate_limited")),
@@ -163,6 +182,31 @@ def _public_token(contract: str, info: dict, sc: dict, ai: dict | None = None, s
         "source": source,
         "ts": time.time(),
         "paper": True,
+        "quote_symbol": info.get("quote_symbol") or "",
+        "quote_kind": info.get("quote_kind") or "",
+        "pair_label": info.get("pair_label") or "",
+        "price_indicative": bool(info.get("price_indicative")),
+        "price_derived": bool(info.get("price_derived")),
+        "multi_hop_txs": info.get("multi_hop_txs"),
+        "fee_sweep": bool(info.get("fee_sweep")),
+        "copycat_role": info.get("copycat_role") or "",
+        "copycat_label": info.get("copycat_label") or "",
+        "copycat_original_symbol": info.get("copycat_original_symbol") or "",
+        "launch_group_size": info.get("launch_group_size"),
+        "launch_group_sold_pct": info.get("launch_group_sold_pct"),
+        "launch_group_confident": bool(info.get("launch_group_confident")),
+        "dev_cashout": bool(info.get("dev_cashout")),
+        "dev_cashout_reason": info.get("dev_cashout_reason") or "",
+        "rug_memory_note": info.get("rug_memory_note") or "",
+        "holders_per_hour": info.get("holders_per_hour"),
+        "holder_retention_pct": info.get("holder_retention_pct"),
+        "kol_exit_note": info.get("kol_exit_note") or "",
+        "helius": bool(os.getenv("HELIUS_API_KEY")),
+        "pf_curve": info.get("pf_curve"),
+        "pf_graduated": bool(info.get("pf_graduated")),
+        "pf_replies": info.get("pf_replies") or 0,
+        "pf_dev_pct": info.get("pf_dev_pct"),
+        "virtual_sol_reserves": info.get("virtual_sol_reserves") or info.get("pf_virtual_sol_lamports"),
     }
     if ai:
         out["ai"] = {
@@ -180,8 +224,12 @@ def _public_token(contract: str, info: dict, sc: dict, ai: dict | None = None, s
 
 
 def _iso(v):
+    """UTC ISO-8601 with a Z suffix. Naive values are local wall time."""
     if isinstance(v, datetime):
-        return v.isoformat()
+        if v.tzinfo is None:
+            v = v.astimezone()
+        v = v.astimezone(timezone.utc).replace(microsecond=0)
+        return v.strftime("%Y-%m-%dT%H:%M:%SZ")
     if isinstance(v, date):
         return v.isoformat()
     return v
@@ -267,7 +315,8 @@ def _me_payload(uid: int, ud: dict) -> dict:
             marked_known = False
     equity = None
     if _balance_ready(ud):
-        equity = round(_num(balance) + savings + marked, 4)
+        # Cash + savings + unspent APEX vault + every open position at the live mark.
+        equity = round(_num(balance) + savings + _num(ud.get("apex_vault")) + marked, 4)
     return {
         "paper": True,
         "uid": uid,
@@ -285,6 +334,67 @@ def _me_payload(uid: int, ud: dict) -> dict:
         "open_positions": len(ud.get("holdings") or {}),
         "quick_buy_amount": _num(ud.get("quick_buy_amount"), 100.0),
     }
+
+
+def _apex_exit_view(h: dict) -> dict | None:
+    """APEX positions have no manual exit plan. Show the rules the checker actually uses."""
+    if (h.get("mood") or "") not in ("APEX", "AI-Sniper", "APEX-DCA"):
+        return None
+    sl = h.get("stop_loss_pct")
+    try:
+        trail = float(h.get("apex_trail_pct") or bot.APEX_TRAIL_PCT_EARLY)
+    except (TypeError, ValueError):
+        trail = bot.APEX_TRAIL_PCT_EARLY
+    activate = bot.APEX_TRAIL_ACTIVATE_X
+    partial = int(round(bot.APEX_LOCK_2X_PCT * 100))
+    rules = []
+    if sl:
+        rules.append(f"Stop loss {float(sl):g}%")
+    else:
+        rules.append("Stop loss set at entry from rug risk")
+    rules.append(f"Trail activates at {activate:g}×")
+    rules.append(f"Trail width {round(trail * 100, 1):g}%")
+    rules.append(f"Sell {partial}% at 2×")
+    rules.append("Threat RED, launch-group dump, or dev cash-out closes the position")
+    return {
+        "stop_loss_pct": sl,
+        "trail_activate_x": activate,
+        "trail_pct": trail,
+        "rules": rules,
+    }
+
+
+def _open_realized(d: dict) -> float:
+    """Partial-sell PnL still sitting on open holdings. Closed rounds are in the log."""
+    return sum(_num(h.get("realized_total")) for h in (d.get("holdings") or {}).values())
+
+
+def _mark_holdings(d: dict) -> float:
+    """Open positions at the live cached price, falling back to cost."""
+    total = 0.0
+    for contract, h in (d.get("holdings") or {}).items():
+        price = None
+        cached = bot._token_cache.get(contract)
+        if cached and isinstance(cached.get("data"), dict):
+            price = cached["data"].get("price")
+        amount = _num(h.get("amount"))
+        if price and amount:
+            total += amount * _num(price)
+        else:
+            total += _num(h.get("total_invested"))
+    return total
+
+
+def _best_win_streak(logs: list) -> int:
+    ordered = sorted(logs, key=lambda t: str(_iso(t.get("closed_at")) or ""))
+    best = cur = 0
+    for t in ordered:
+        if _num(t.get("realized_pnl")) > 0:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return best
 
 
 async def _position_rows(ud: dict) -> list[dict]:
@@ -308,6 +418,10 @@ async def _position_rows(ud: dict) -> list[dict]:
         cost = _num(h.get("total_invested"))
         value = amount * price
         pnl = value - cost
+        buy_cost = _num(h.get("buy_cost")) or cost
+        remain = (cost / buy_cost) if buy_cost else 1.0
+        entry_fees = _num(h.get("entry_fees")) * remain
+        pnl_net = pnl - entry_fees
         avg = _num(h.get("avg_price"))
         rows.append({
             "contract": contract,
@@ -321,9 +435,13 @@ async def _position_rows(ud: dict) -> list[dict]:
             "value": round(value, 4),
             "cost": round(cost, 4),
             "pnl": round(pnl, 4),
-            "pnl_pct": round((pnl / cost * 100), 2) if cost else 0.0,
+            "pnl_net": round(pnl_net, 4),
+            "entry_fees": round(entry_fees, 4),
+            "pnl_pct": round((pnl_net / cost * 100), 2) if cost else 0.0,
             "x": round(price / avg, 4) if avg else 0.0,
             "mood": h.get("mood") or "",
+            "exit_plan": h.get("exit_plan"),
+            "apex_exit": _apex_exit_view(h),
             "bought_at": _iso(h.get("bought_at")),
             "liq": _num(info.get("liq")) if info else _num(h.get("liq_at_buy")),
             "mc": _num(info.get("mc")) if info else 0.0,
@@ -367,9 +485,9 @@ def _leaderboard(sort: str, me: int) -> list[dict]:
             continue
         wins = [t for t in logs if _num(t.get("realized_pnl")) > 0]
         wr = round(len(wins) / len(logs) * 100, 1) if logs else 0.0
-        pnl = sum(_num(t.get("realized_pnl")) for t in logs)
-        invested = sum(_num(h.get("total_invested")) for h in (d.get("holdings") or {}).values())
-        eq = _num(d.get("balance")) + invested + _num(d.get("savings"))
+        pnl = sum(_num(t.get("realized_pnl")) for t in logs) + _open_realized(d)
+        marked = _mark_holdings(d)
+        eq = _num(d.get("balance")) + marked + _num(d.get("savings")) + _num(d.get("apex_vault"))
         start = _num(d.get("starting_balance"), 5000) or 5000
         growth = round((eq - start) / start * 100, 1) if start > 0 else 0.0
         scores.append({
@@ -379,7 +497,7 @@ def _leaderboard(sort: str, me: int) -> list[dict]:
             "win_rate": wr,
             "trades": len(logs),
             "growth": growth,
-            "streak": int(d.get("best_streak") or 0),
+            "streak": _best_win_streak(logs),
             "is_me": uid == me,
         })
     key = {"pnl": "pnl", "wr": "win_rate"}.get(sort, "equity")
@@ -398,13 +516,23 @@ def _apex_payload(uid: int, ud: dict) -> dict:
         paused = bot.apex_is_paused(uid)
     except Exception:
         paused = False
-    try:
-        halted = bot.apex_is_daily_loss_halted(ud)
-    except Exception:
-        halted = False
+    enabled = bool(ud.get("apex_mode"))
+    # An idle vault with APEX off is not a daily-loss halt.
+    halted = False
+    if enabled:
+        try:
+            halted = bool(bot.apex_is_daily_loss_halted(ud))
+        except Exception:
+            halted = False
     total = int(ud.get("apex_total_trades") or 0)
     wins = int(ud.get("apex_total_wins") or 0)
-    enabled = bool(ud.get("apex_mode"))
+    logs = [
+        t for t in (bot.trade_log.get(uid) or [])
+        if (t.get("mood") or "") in ("APEX", "AI-Sniper", "APEX-DCA")
+    ]
+    if logs and len(logs) >= total:
+        total = len(logs)
+        wins = sum(1 for t in logs if _num(t.get("realized_pnl")) > 0)
     if enabled and paused:
         state = "paused"
     elif enabled and halted:
@@ -426,16 +554,33 @@ def _apex_payload(uid: int, ud: dict) -> dict:
         "profit_sent": round(_num(ud.get("apex_vault_total_profit_sent")), 4),
         "daily_pnl": round(_num(ud.get("apex_daily_pnl")), 4),
         "heat_pct": heat,
+        "deployed": round(sum(
+            _num(h.get("total_invested"))
+            for h in (ud.get("holdings") or {}).values()
+            if (h.get("mood") or "") in ("APEX", "AI-Sniper", "APEX-DCA")
+        ), 4),
         "positions": bot.apex_count_positions(ud),
         "trades": total,
         "wins": wins,
-        "win_rate": round(wins / total * 100, 1) if total else 0.0,
+        "win_rate": round(wins / total * 100, 1) if total else None,
         "consec_losses": int(ud.get("apex_consec_losses") or 0),
         "phase": bot.apex_get_phase(ud),
         "balance": ud.get("balance"),
         "buy_amount": _num((ud.get("sniper_filters") or {}).get("buy_amount"), 20),
         "sniper_paused": bool(getattr(bot, "_admin_sniper_paused", False)),
+        "mood": _cached_mood(),
     }
+
+
+def _cached_mood():
+    try:
+        from edge.flags import market_mood
+        if not market_mood():
+            return None
+        from edge.mood import cached
+        return cached()
+    except Exception:
+        return None
 
 
 def _set_apex(uid: int, ud: dict, enabled: bool) -> None:
@@ -488,40 +633,67 @@ def _withdraw_vault(uid: int, ud: dict, amount: float | None, take_all: bool) ->
 
 
 async def refresh_feed() -> int:
-    """One sniper_scan pass, scored with the bot's sniper_score. No extra trading rules."""
-    global _last_refresh_ts
+    """One sniper_scan pass. Concurrent callers share the in-flight scan."""
+    global _feed_refresh_task
     async with _feed_lock:
-        try:
-            raw = await bot.sniper_scan()
-        except Exception as exc:
-            logger.warning("terminal feed scan failed: %s", exc)
+        task = _feed_refresh_task
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(_refresh_feed_body())
+            _feed_refresh_task = task
+    return await task
+
+
+async def _refresh_feed_body() -> int:
+    """Score one sniper_scan pass. No extra trading rules."""
+    global _last_refresh_ts
+    try:
+        raw = await bot.sniper_scan()
+    except Exception as exc:
+        logger.warning("terminal feed scan failed: %s", exc)
+        return 0
+    items = []
+    seen = set()
+    for item in raw or []:
+        addr = (item or {}).get("tokenAddress") or ""
+        if addr and addr not in seen:
+            seen.add(addr)
+            items.append(item)
+    if not items:
+        _last_refresh_ts = time.time()
+        return 0
+    # pump.fun births are first in sniper_scan and usually have no DexScreener
+    # pair yet. Walk past those so the first SCAN_CAP rows are tokens we can price.
+    def _rank(item: dict) -> int:
+        if item.get("pairAddress") or item.get("pair_addr"):
             return 0
-        items = []
-        seen = set()
-        for item in raw or []:
-            addr = (item or {}).get("tokenAddress") or ""
-            if addr and addr not in seen:
-                seen.add(addr)
-                items.append(item)
-            if len(items) >= SCAN_CAP:
-                break
-        if not items:
-            _last_refresh_ts = time.time()
-            return 0
-        await asyncio.gather(
-            *[bot.get_token(i["tokenAddress"]) for i in items],
+        if (item.get("source") or "") == "dexscreener":
+            return 1
+        return 2
+
+    items.sort(key=_rank)
+    scored = 0
+    idx = 0
+    while idx < len(items) and scored < SCAN_CAP:
+        batch = items[idx:idx + 12]
+        idx += 12
+        infos = await asyncio.gather(
+            *[bot.get_token(i["tokenAddress"]) for i in batch],
             return_exceptions=True,
         )
-        scored = 0
-        for item in items:
-            contract = item["tokenAddress"]
-            info = await bot.get_token(contract)
-            if not info:
+        for item, info in zip(batch, infos):
+            if isinstance(info, Exception) or not info or not info.get("pair_addr"):
                 continue
-            info["pf_curve"] = item.get("_pf_curve")
-            info["pf_replies"] = item.get("_pf_replies", 0)
-            info["pf_graduated"] = item.get("_pf_graduated", False)
-            info["pf_dev_pct"] = item.get("_pf_dev_pct")
+            info["pf_curve"] = item.get("_pf_curve") if item.get("_pf_curve") is not None else info.get("pf_curve")
+            info["pf_replies"] = item.get("_pf_replies", info.get("pf_replies") or 0)
+            info["pf_graduated"] = item.get("_pf_graduated", info.get("pf_graduated", False))
+            info["pf_dev_pct"] = item.get("_pf_dev_pct") if item.get("_pf_dev_pct") is not None else info.get("pf_dev_pct")
+            if item.get("_pf_virtual_sol_lamports"):
+                info["virtual_sol_reserves"] = item["_pf_virtual_sol_lamports"]
+                info["pf_virtual_sol_lamports"] = item["_pf_virtual_sol_lamports"]
+            if item.get("_pf_real_token_reserves") is not None:
+                info["real_token_reserves"] = item["_pf_real_token_reserves"]
+            if item.get("_pf_quote_decimals") is not None:
+                info["quote_decimals"] = item["_pf_quote_decimals"]
             info["boost_amount"] = item.get("_boost_amount", info.get("boost_amount") or 0)
             if not info.get("twitter") and item.get("_pf_twitter"):
                 info["twitter"] = item["_pf_twitter"]
@@ -530,23 +702,26 @@ async def refresh_feed() -> int:
             if not info.get("website") and item.get("_pf_website"):
                 info["website"] = item["_pf_website"]
             sc = bot.sniper_score(info)
-            record_scan(contract, info, sc, source="scan")
+            record_scan(contract=item["tokenAddress"], info=info, sc=sc, source="scan")
             scored += 1
-        _last_refresh_ts = time.time()
-        return scored
+            if scored >= SCAN_CAP:
+                break
+    _last_refresh_ts = time.time()
+    return scored
 
 
 async def _feed_loop() -> None:
-    await asyncio.sleep(8)
+    """Backfill an empty terminal. sniper_job already publishes scans."""
+    await asyncio.sleep(45)
     while True:
         try:
-            if time.time() - max(_last_record_ts, _last_refresh_ts) > FEED_STALE_S:
+            if not _feed and time.time() - _last_record_ts > 20:
                 await refresh_feed()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("terminal feed refresh")
-        await asyncio.sleep(120)
+        await asyncio.sleep(60)
 
 
 def _candles_from_ohlcv(rows: list) -> list[dict]:
@@ -666,6 +841,19 @@ def create_app() -> FastAPI:
         info = await bot.get_token(contract)
         if not info:
             raise HTTPException(status_code=404, detail="Token not found on DexScreener")
+        try:
+            from edge.enrich import enrich_onchain
+            await enrich_onchain(contract, info)
+        except Exception:
+            logger.debug("token detail enrich failed", exc_info=True)
+        fed = _feed.get(contract) or {}
+        bot.carry_curve_fields(info, {
+            "pf_curve": fed.get("pf_curve"),
+            "pf_graduated": fed.get("pf_graduated"),
+            "pf_replies": fed.get("pf_replies"),
+            "pf_dev_pct": fed.get("pf_dev_pct"),
+            "virtual_sol_reserves": fed.get("virtual_sol_reserves"),
+        })
         sc = bot.sniper_score(info)
         ai = await bot.ai_analyze_token(info, sc, ud, uid)
         payload = _public_token(contract, info, sc, ai=ai, source="detail")
@@ -674,23 +862,39 @@ def create_app() -> FastAPI:
             price = _num(info.get("price"))
             cost = _num(held.get("total_invested"))
             value = _num(held.get("amount")) * price
+            buy_cost = _num(held.get("buy_cost")) or cost
+            remain = (cost / buy_cost) if buy_cost else 1.0
+            entry_fees = _num(held.get("entry_fees")) * remain
+            pnl = value - cost
             payload["position"] = {
                 "amount": _num(held.get("amount")),
                 "cost": cost,
                 "value": round(value, 4),
-                "pnl": round(value - cost, 4),
+                "pnl": round(pnl, 4),
+                "pnl_net": round(pnl - entry_fees, 4),
+                "entry_fees": round(entry_fees, 4),
                 "avg_price": _num(held.get("avg_price")),
+                "exit_plan": held.get("exit_plan"),
+                "apex_exit": _apex_exit_view(held),
+                "mood": held.get("mood") or "",
             }
         else:
             payload["position"] = None
         try:
-            from slippage import slippage_pct, trade_cost_usd
+            from slippage import slippage_pct, trade_cost_usd, tradable_liquidity_usd
             sample = _num(ud.get("quick_buy_amount"), 100) or 100
-            payload["slippage"] = {
-                "sample_usd": sample,
-                "slippage_pct": round(slippage_pct(sample, info.get("liq")) * 100, 3),
-                "cost_usd": trade_cost_usd(sample, info.get("liq")),
-            }
+            tradable = tradable_liquidity_usd(info.get("liq"), None)
+            if tradable is None:
+                quote = await bot.bonding_curve_quote_usd(info, contract)
+                tradable = tradable_liquidity_usd(0, quote)
+            if tradable is None:
+                payload["slippage"] = None
+            else:
+                payload["slippage"] = {
+                    "sample_usd": sample,
+                    "slippage_pct": round(slippage_pct(sample, tradable) * 100, 3),
+                    "cost_usd": trade_cost_usd(sample, tradable),
+                }
         except Exception:
             payload["slippage"] = None
         return payload
@@ -735,11 +939,23 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="Set a starting balance with /start in Telegram first")
         contract = body.contract.strip()
         fees_before = _num(ud.get("total_fees_paid"))
+        plan = None
+        if any(v is not None for v in (body.preset, body.tp_x, body.tp_pct, body.invalidation_pct, body.time_stop_min)):
+            plan = {
+                "preset": body.preset,
+                "tp_x": body.tp_x,
+                "tp_pct": body.tp_pct,
+                "invalidation_pct": body.invalidation_pct,
+                "time_stop_min": body.time_stop_min,
+            }
         async with bot._get_user_lock(uid):
-            result = await bot.do_buy_core(ud, uid, contract, float(body.amount_usd), planned=True, mood="")
+            result = await bot.do_buy_core(
+                ud, uid, contract, float(body.amount_usd), planned=True, mood="", exit_plan=plan,
+            )
         if isinstance(result, str):
             raise HTTPException(status_code=400, detail=result)
         info, tokens = result
+        held = (ud.get("holdings") or {}).get(contract) or {}
         return {
             "paper": True,
             "ok": True,
@@ -753,6 +969,7 @@ def create_app() -> FastAPI:
             "balance": ud.get("balance"),
             "liq": info.get("liq"),
             "mc": info.get("mc"),
+            "exit_plan": held.get("exit_plan"),
         }
 
     @app.post("/api/trade/sell")
@@ -777,8 +994,17 @@ def create_app() -> FastAPI:
             if usd_amount <= 0:
                 raise HTTPException(status_code=400, detail="Invalid sell amount")
             # Same plan-tracking side effects as do_sell_query / do_sell_msg.
+            # An intact exit plan is a rule break, not a followed-plan streak.
             pending_targets = [t for t in h.get("auto_sells", []) if not t.get("triggered")]
-            if pending_targets:
+            plan_intact = False
+            plan = h.get("exit_plan")
+            if plan:
+                try:
+                    from edge.exit_plan import evaluate as _eval_exit
+                    plan_intact = _eval_exit(plan, h, _num(info.get("price"))) is None
+                except Exception:
+                    plan_intact = True
+            if pending_targets or plan_intact:
                 ud["broken"] = ud.get("broken", 0) + 1
                 ud["streak"] = 0
                 h["followed_plan"] = False
@@ -786,6 +1012,8 @@ def create_app() -> FastAPI:
                 ud["followed"] = ud.get("followed", 0) + 1
                 ud["streak"] = ud.get("streak", 0) + 1
                 ud["best_streak"] = max(ud.get("best_streak", 0), ud["streak"])
+                if plan:
+                    h["followed_plan"] = True
             ud["daily_trades"] = ud.get("daily_trades", 0) + 1
             avg = _num(h.get("avg_price"), _num(info.get("price")))
             symbol = h.get("symbol")
@@ -808,6 +1036,33 @@ def create_app() -> FastAPI:
             "balance": ud.get("balance"),
             "auto_saved": result.get("auto_saved"),
         }
+
+    @app.get("/api/mood")
+    async def market_mood(user=Depends(current_user)):
+        """Mood gauge plus today's rule-break tally for this paper account."""
+        uid, ud = user
+        mood = _cached_mood()
+        try:
+            from edge.flags import market_mood as mood_on
+            if mood_on() and mood is None:
+                from edge.mood import refresh
+                mood = await refresh()
+        except Exception:
+            logger.debug("mood refresh failed", exc_info=True)
+        discipline = {"breaks": 0, "break_cost": 0, "overrides": 0, "rows": []}
+        presets = {}
+        try:
+            from edge.exit_plan import PRESETS, nightly_report
+            from edge.flags import exit_plan as plans_on
+            presets = PRESETS
+            if plans_on():
+                today = datetime.now(bot.BOT_TZ).date()
+                from datetime import time as dtime
+                start = datetime.combine(today, dtime.min, tzinfo=bot.BOT_TZ).timestamp()
+                discipline = nightly_report(ud, start)
+        except Exception:
+            logger.debug("discipline payload failed", exc_info=True)
+        return {"paper": True, "mood": mood, "discipline": discipline, "presets": presets, "uid": uid}
 
     @app.get("/api/apex")
     async def apex_status(user=Depends(current_user)):

@@ -75,6 +75,11 @@ if _USE_SQLITE:
         updated REAL    NOT NULL,
         PRIMARY KEY (uid)
     );
+    CREATE TABLE IF NOT EXISTS kv (
+        key     TEXT PRIMARY KEY,
+        data    TEXT    NOT NULL,
+        updated REAL    NOT NULL
+    );
     """
 else:
     DB_PATH = None
@@ -324,6 +329,88 @@ def save_all(uid: int, ud: dict, log: list):
     save_trade_log(uid, log)
 
 
+_kv_savers: list = []
+_kv_warned = False
+
+
+def register_kv_saver(fn) -> None:
+    """autosave_job calls each saver. Used for rug memory and the copycat index."""
+    if fn not in _kv_savers:
+        _kv_savers.append(fn)
+
+
+def save_kv(key: str, obj) -> None:
+    """Persist one JSON blob. SQLite table `kv`, or Supabase `bot_kv`."""
+    global _kv_warned
+    try:
+        data_str = _dumps(obj)
+    except Exception as exc:
+        logger.error("save_kv(%s) serialise failed: %s", key, exc)
+        return
+    if _USE_SQLITE:
+        try:
+            init_db()
+            with _sqlite_conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv (key, data, updated) VALUES (?, ?, ?)",
+                    (key, data_str, time.time()),
+                )
+        except Exception as exc:
+            logger.error("save_kv sqlite %s: %s", key, exc)
+        return
+    try:
+        response = httpx.post(
+            f"{_SUPABASE_URL}/rest/v1/bot_kv",
+            headers={**_HEADERS, "Prefer": "resolution=merge-duplicates"},
+            content=json.dumps({"key": key, "data": data_str, "updated": int(time.time())}),
+            timeout=10,
+        )
+        if response.status_code not in (200, 201):
+            if not _kv_warned:
+                logger.error(
+                    "Supabase bot_kv upsert failed (%s). Create the table from README. %s",
+                    response.status_code, response.text[:160],
+                )
+                _kv_warned = True
+    except Exception as exc:
+        logger.error("save_kv supabase %s: %s", key, exc)
+
+
+def load_kv(key: str):
+    """Return the decoded blob, or None when the key or table is missing."""
+    global _kv_warned
+    if _USE_SQLITE:
+        try:
+            init_db()
+            with _sqlite_conn() as conn:
+                row = conn.execute("SELECT data FROM kv WHERE key = ?", (key,)).fetchone()
+            if not row:
+                return None
+            return _loads(row["data"])
+        except Exception as exc:
+            logger.error("load_kv sqlite %s: %s", key, exc)
+            return None
+    try:
+        response = httpx.get(
+            f"{_SUPABASE_URL}/rest/v1/bot_kv",
+            headers=_HEADERS,
+            params={"select": "data", "key": f"eq.{key}"},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            if not _kv_warned:
+                logger.error("Supabase bot_kv read failed (%s)", response.status_code)
+                _kv_warned = True
+            return None
+        rows = response.json()
+        if not rows:
+            return None
+        return _loads(rows[0]["data"])
+    except Exception as exc:
+        logger.error("load_kv supabase %s: %s", key, exc)
+        return None
+
+
 # ── Live state registry ──────────────────────────────────────────────────────
 # The bot registers references to its in-memory dicts at startup. autosave_job
 # reads these instead of importing sol_trading_bot.
@@ -364,4 +451,9 @@ async def autosave_job(context):
             saved += 1
         except Exception as e:
             logger.error("autosave uid %s: %s", uid, e)
+    for saver in list(_kv_savers):
+        try:
+            saver()
+        except Exception as exc:
+            logger.error("autosave kv saver: %s", exc)
     logger.debug("Autosave: %d users saved", saved)

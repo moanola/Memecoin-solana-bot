@@ -234,3 +234,227 @@ async def test_feed_and_apex_toggle(api):
     assert funded.status_code == 200
     assert bot.users[UID]["apex_vault"] == pytest.approx(250, abs=0.01)
     assert bot.users[UID]["balance"] < 800
+
+
+async def test_unknown_exit_preset_is_422(api):
+    client, _prices = api
+    bot.users[UID] = _user()
+    res = await client.post(
+        "/api/trade/buy",
+        headers=_headers(),
+        json={"contract": MINT, "amount_usd": 25, "preset": "yolo"},
+    )
+    assert res.status_code == 422
+    detail = res.json()["detail"]
+    assert isinstance(detail, list)
+    assert "preset" in res.text.lower()
+    assert MINT not in bot.users[UID]["holdings"]
+
+
+async def test_early_sell_is_a_rule_break_not_a_streak(api):
+    client, _prices = api
+    bot.users[UID] = _user()
+    bot.trade_log[UID] = []
+    bought = await client.post(
+        "/api/trade/buy", headers=_headers(),
+        json={"contract": MINT, "amount_usd": 100, "preset": "standard"},
+    )
+    assert bought.status_code == 200, bought.text
+    pos = await client.get("/api/positions", headers=_headers())
+    row = pos.json()["positions"][0]
+    assert row["pnl_net"] < 0
+    sold = await client.post(
+        "/api/trade/sell", headers=_headers(),
+        json={"contract": MINT, "percent": 100},
+    )
+    assert sold.status_code == 200, sold.text
+    ud = bot.users[UID]
+    assert ud["streak"] == 0
+    assert ud["broken"] >= 1
+    assert ud.get("rule_breaks")
+    me = (await client.get("/api/me", headers=_headers())).json()
+    hist = (await client.get("/api/history", headers=_headers())).json()["trades"]
+    assert hist[0]["closed_at"].endswith("Z")
+    assert sum(t["realized_pnl"] for t in hist) == pytest.approx(me["realized_pnl"], abs=0.05)
+    assert hist[0]["invested"] == pytest.approx(100, abs=1)
+
+
+async def test_partial_then_flat_history_matches_header(api, monkeypatch):
+    client, prices = api
+    bot.users[UID] = _user()
+    bot.trade_log[UID] = []
+    await client.post(
+        "/api/trade/buy", headers=_headers(),
+        json={"contract": MINT, "amount_usd": 100, "preset": "runner"},
+    )
+    prices.price = 0.0008
+    await client.post(
+        "/api/trade/sell", headers=_headers(),
+        json={"contract": MINT, "percent": 40},
+    )
+    assert MINT in bot.users[UID]["holdings"]
+    await client.post(
+        "/api/trade/sell", headers=_headers(),
+        json={"contract": MINT, "percent": 100},
+    )
+    me = (await client.get("/api/me", headers=_headers())).json()
+    hist = (await client.get("/api/history", headers=_headers())).json()["trades"]
+    assert len(hist) == 1
+    assert hist[0]["invested"] == pytest.approx(100, abs=1)
+    assert sum(t["realized_pnl"] for t in hist) == pytest.approx(me["realized_pnl"], abs=0.05)
+
+
+async def test_leaderboard_live_mark_and_win_streak(api):
+    client, _prices = api
+    bot.users[UID] = _user(balance=900)
+    bot.users[UID]["best_streak"] = 4
+    bot.trade_log[UID] = [
+        {"symbol": "A", "realized_pnl": -1, "closed_at": "2026-01-01T00:00:00Z"},
+        {"symbol": "B", "realized_pnl": -1, "closed_at": "2026-01-02T00:00:00Z"},
+        {"symbol": "C", "realized_pnl": 5, "closed_at": "2026-01-03T00:00:00Z"},
+        {"symbol": "D", "realized_pnl": -1, "closed_at": "2026-01-04T00:00:00Z"},
+    ]
+    bot.users[UID]["holdings"] = {
+        MINT: {"symbol": "PEPE", "amount": 100, "total_invested": 10, "avg_price": 0.1, "mood": ""},
+    }
+    bot._token_cache[MINT] = {"ts": time.time(), "data": {"price": 0.5}}
+    board = await client.get("/api/leaderboard?sort=equity", headers=_headers())
+    row = next(r for r in board.json()["rows"] if r["is_me"])
+    assert row["equity"] == pytest.approx(950, abs=0.05)
+    assert row["win_rate"] == 25.0
+    assert row["streak"] == 1
+
+
+async def test_apex_off_is_not_halted_and_open_position_has_heat(api):
+    client, _prices = api
+    ud = _user(balance=5_000)
+    ud["apex_mode"] = False
+    ud["apex_vault"] = 0.0
+    bot.users[UID] = ud
+    off = (await client.get("/api/apex", headers=_headers())).json()
+    assert off["state"] == "off"
+    assert off["halted"] is False
+    ud["apex_mode"] = True
+    ud["apex_vault"] = 80.0
+    ud["apex_daily_pnl"] = 0.0
+    ud["apex_session_start_bal"] = 100.0
+    ud["holdings"] = {
+        MINT: {
+            "symbol": "LARPSCAN", "amount": 20, "total_invested": 20, "avg_price": 1,
+            "mood": "APEX", "stop_loss_pct": 22, "apex_trail_pct": 0.22,
+        },
+    }
+    on = (await client.get("/api/apex", headers=_headers())).json()
+    assert on["positions"] == 1
+    assert on["heat_pct"] == pytest.approx(20.0, abs=0.2)
+    assert on["win_rate"] is None
+    detail = await client.get(f"/api/tokens/{MINT}", headers=_headers())
+    assert detail.status_code == 200, detail.text
+    rules = detail.json()["position"]["apex_exit"]["rules"]
+    assert any("Trail" in r for r in rules)
+    assert any("2" in r for r in rules)
+
+
+async def test_concurrent_feed_refresh_is_one_scan(api, monkeypatch):
+    import asyncio
+
+    client, _prices = api
+    bot.users[UID] = _user()
+    webapi._feed_refresh_task = None
+    calls = {"n": 0}
+
+    async def slow():
+        calls["n"] += 1
+        await asyncio.sleep(0.3)
+        return []
+
+    monkeypatch.setattr(bot, "sniper_scan", slow)
+    a, b = await asyncio.gather(
+        client.get("/api/feed?refresh=true", headers=_headers()),
+        client.get("/api/feed?refresh=true", headers=_headers()),
+    )
+    assert a.status_code == 200 and b.status_code == 200
+    assert calls["n"] == 1
+
+
+async def test_equity_includes_vault_and_open_partials(api):
+    client, _prices = api
+    ud = _user(balance=900)
+    ud["apex_vault"] = 80.0
+    ud["savings"] = 10.0
+    ud["realized_pnl"] = -8.0
+    ud["holdings"] = {
+        MINT: {
+            "symbol": "PEPE", "amount": 100, "total_invested": 10,
+            "avg_price": 0.1, "mood": "APEX", "realized_total": -3.0,
+        },
+    }
+    bot.users[UID] = ud
+    bot.trade_log[UID] = [
+        {"symbol": "A", "realized_pnl": -5, "closed_at": "2026-01-01T00:00:00Z"},
+    ]
+    bot._token_cache[MINT] = {"ts": time.time(), "data": {"price": 0.5}}
+    me = (await client.get("/api/me", headers=_headers())).json()
+    # 900 cash + 10 savings + 80 vault + 50 live mark
+    assert me["equity"] == pytest.approx(1040, abs=0.05)
+    board = await client.get("/api/leaderboard?sort=equity", headers=_headers())
+    row = next(r for r in board.json()["rows"] if r["is_me"])
+    assert row["equity"] == pytest.approx(1040, abs=0.05)
+    # Closed log is -5. The open partial (-3) is in the header and on the board.
+    assert row["pnl"] == pytest.approx(-8, abs=0.05)
+
+
+async def test_zero_liq_hides_slippage_preview(api, monkeypatch):
+    client, _prices = api
+    bot.users[UID] = _user()
+
+    async def zero(contract, force=False, max_age=None):
+        return {
+            "symbol": "Z", "name": "Zero", "chain": "solana", "price": 1e-6,
+            "mc": 1_000, "liq": 0, "pair_addr": "p", "dex": "pumpfun",
+            "age_h": 0.2, "buy_pct": 50, "rug_risks": [],
+        }
+
+    async def no_coin(_mint):
+        return None
+
+    monkeypatch.setattr(bot, "get_token", zero)
+    monkeypatch.setattr(bot, "_fetch_pumpfun_coin", no_coin)
+    detail = await client.get(f"/api/tokens/{MINT}", headers=_headers())
+    assert detail.status_code == 200
+    assert detail.json()["slippage"] is None
+
+
+async def test_feed_skips_pairless_pumpfun(api, monkeypatch):
+    client, _prices = api
+    bot.users[UID] = _user()
+    pumps = [
+        {"tokenAddress": f"PUMP{i:02d}xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "source": "pumpfun", "_pf_curve": 20}
+        for i in range(30)
+    ]
+    pairs = [
+        {"tokenAddress": f"PAIR{i:02d}yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "source": "dexscreener"}
+        for i in range(5)
+    ]
+
+    async def scan():
+        return pumps + pairs
+
+    async def gt(contract, force=False, max_age=None):
+        if str(contract).startswith("PAIR"):
+            return {
+                "symbol": "P", "name": "P", "chain": "solana", "price": 0.01,
+                "mc": 20_000, "liq": 8_000, "pair_addr": "px", "dex": "raydium",
+                "age_h": 1, "buy_pct": 55, "rug_risks": [],
+            }
+        return None
+
+    monkeypatch.setattr(bot, "sniper_scan", scan)
+    monkeypatch.setattr(bot, "get_token", gt)
+    webapi._feed.clear()
+    webapi._feed_refresh_task = None
+    res = await client.get("/api/feed?refresh=true", headers=_headers())
+    assert res.status_code == 200
+    tokens = res.json()["tokens"]
+    assert len(tokens) == 5
+    assert all(t["contract"].startswith("PAIR") for t in tokens)

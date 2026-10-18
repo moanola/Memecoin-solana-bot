@@ -25,14 +25,61 @@ size vs pool liquidity), plus $0.002 gas.
 - Admin: `/admin` (approve/deny access, ban, broadcast, pause sniper, ...).
 - Mobile terminal: a Telegram Mini App and an installable PWA on the same
   paper account (token feed, chart, quick buy/sell, live positions, APEX, leaderboard).
+- Edge signals (each behind a flag, on by default). See **Edge features** below.
 
 Data sources: DexScreener, pump.fun frontend API, RugCheck, Helius (optional),
-GeckoTerminal, CoinGecko (SOL price fallback), Twitter oEmbed, Anthropic (optional).
+GeckoTerminal, CoinGecko (SOL price fallback), Twitter oEmbed, Anthropic (optional),
+[MemeFees](https://memefees.com) (pump.fun fees, volume, fee share; fees and volume are DefiLlama's).
+
+## Edge features
+
+Paper signals only. Nothing here signs a transaction. Logic lives in `edge/`
+and is called from the bot, the API, and the terminal. Flags are read from the
+environment on each use (`true` / `false`). Defaults are on.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `EDGE_CUSTOM_PAIRS` | `true` | Price, volume, and maker/wash stats when the quote is not SOL. Shows the pair on token cards and the terminal. |
+| `EDGE_KOL_EXITS` | `true` | KOL sell alerts (partial/full, % of bag), airdrop-vs-buy, side wallets from a shared SOL funder, and decay of the KOL score boost. |
+| `EDGE_LAUNCH_GROUP` | `true` | Cluster earliest buyers (same slot plus Jito tip, common funder, or identical fee and compute). |
+| `EDGE_LAUNCH_GROUP_EXIT_PCT` | `40` | APEX exits when a *confident* launch group has sold at least this percent. |
+| `EDGE_DEV_CASHOUT` | `true` | Pre-dump alert and a score penalty when seller SOL consolidates, or a hub pays sellers' gas. |
+| `EDGE_DEV_CASHOUT_APEX_EXIT` | `true` | That alert is also an APEX exit. |
+| `EDGE_RUG_MEMORY` | `true` | Remember creator/funder wallets and penalise a later launch linked to a rug. |
+| `EDGE_RUG_DROP_PCT` | `90` | Fast-drop rug: price down this percent. |
+| `EDGE_RUG_WINDOW_MIN` | `30` | Window for that drop. LP pull and a confident group dump also mark a rug. |
+| `EDGE_COPYCAT` | `true` | Group lookalike name/ticker/image launches. Copies are labelled and not auto-bought. |
+| `EDGE_HOLDER_VELOCITY` | `true` | Holders/hour and, when history reaches the launch, % of the first ~70 buyers still holding. |
+| `EDGE_HOLDER_REENTRY_MIN_RETENTION` | `25` | Watchlist re-entry blocks only when retention is known and below this. |
+| `EDGE_MARKET_MOOD` | `true` | Daily pump.fun mood. Scales APEX size and the heat ceiling. Shown on `/stats` and the terminal. |
+| `EDGE_EXIT_PLAN` | `true` | Manual paper buys store a take-profit, invalidation, and time stop. The checker enforces them. |
+| `EDGE_EXIT_DEFAULT_PRESET` | `standard` | `scalp` (1.5× / 12% / 30m), `standard` (2× / 18% / 120m), or `runner` (3× / 25% / 360m). |
+| `EDGE_HELIUS_PER_MIN` | `8` | Cap on the shared launch-group / cash-out / retention Helius page. |
+
+### Data sources and what was verified
+
+- **Custom pairs.** [pump.fun/docs/custom-pairs](https://pump.fun/docs/custom-pairs) (page last updated 2026-10-09): any pump.fun coin can be the quote; buys route through the parent pool; holder rewards are paid in the paired asset. The Supported Pair Assets table is copied into `edge/supported_quotes.py`. A mint that is not on that list is labelled `unlisted`. Secondary Pair Asset status is fixed at the parent's launch and is **not** on the list, so the bot does not claim a mint is a secondary pair.
+- **PumpSwap pool.** Public IDL `pump_amm.json`, program `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`. `Pool.virtual_quote_reserves` is a signed i128. Spot uses `vault + virtual` (clamped at 0), times the quote asset's USD price. `protocol_fees` and `creator_fees` sit on the account until collected; a sweep is a **drop versus the previous observation** of that pair, never a single snapshot. Verified instruction discriminators: `buy`, `buy_exact_quote_in`, `buy_exact_quote_in_v2`, `sell`, `sell_v2`, `multi_hop_swap`. The fetched IDL has **no v3 trade instruction and no synthetic-migration instruction**. Those names from the October 2026 write-ups are not decoded.
+- **DexScreener `priceNative`** is the chain-native price (SOL), not quote-token units. It is not multiplied by the quote's USD price. USD is derived only when `priceUsd` is missing and both liquidity sides are present. Custom and unlisted quotes are marked indicative, matching the docs on multi-pool prices.
+- **Jito tip accounts** are the eight addresses published by Jito. A Helius `source` of `JITO` is also accepted. Same-slot clustering is a heuristic, not proof of one bundle.
+- **Helius enhanced transactions** (`type`, `feePayer`, `tokenTransfers`, `nativeTransfers`, `slot`, `fee`) are a parser schema. KOL bag percent needs the in-memory ledger. A shared SOL funder is not a proven identity link. Retention is computed only when the transaction page is shorter than the fetch limit; a full newest-first page is not treated as the first buyers, and it will not auto-exit a launch group.
+- **Market mood.** `GET https://memefees.com/api/v1/pad-daily?pad=pump-fun&days=14` and `GET https://memefees.com/api/v1/market-share` (no key). Fees and volume are DefiLlama (`source=defillama`). Attribute MemeFees and link memefees.com. MemeFees-produced data is CC BY 4.0. If those endpoints fail, the gauge falls back to a GeckoTerminal pumpswap pool volume sum and says that fee share is unknown.
+
+Rug-wallet memory and the copycat index are stored in the persistence `kv` blob (`rug_memory`, `copycat_index`), flushed by the existing autosave. Supabase needs:
+
+```sql
+CREATE TABLE IF NOT EXISTS bot_kv (
+    key TEXT PRIMARY KEY, data TEXT NOT NULL, updated BIGINT NOT NULL);
+ALTER TABLE bot_kv ENABLE ROW LEVEL SECURITY;
+```
+
+SQLite creates the same `kv` table on its own. If `bot_kv` is missing, the bot logs the error once and keeps running.
 
 ## Layout
 | File | Purpose |
 |---|---|
 | `sol_trading_bot.py` | Main bot: handlers, scoring, sniper/APEX jobs, UI. Starts the API on the same loop |
+| `edge/` | Paper-only edge signals (custom pairs, KOL exits, launch group, cash-out, rug memory, copycats, holders, mood, exit plans) |
 | `webapi.py` | FastAPI terminal: balance, positions, feed, paper buy/sell, APEX, leaderboard, WebSocket |
 | `telegram_auth.py` | Mini App initData and Login Widget checks (HMAC, auth_date) |
 | `config.py` | Environment-driven settings and simulated-cost constants |

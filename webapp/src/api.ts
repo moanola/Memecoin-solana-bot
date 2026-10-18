@@ -3,7 +3,9 @@ import type {
   ApexStatus,
   BoardRow,
   Candle,
+  ExitPlan,
   FeedToken,
+  MarketMood,
   Me,
   Position,
   Tick,
@@ -20,6 +22,30 @@ export class ApiError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+function formatDetail(detail: unknown): string {
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object") {
+        const row = item as { loc?: unknown; msg?: unknown; message?: unknown };
+        const loc = Array.isArray(row.loc)
+          ? row.loc.filter((part) => part !== "body" && part !== "query").join(".")
+          : "";
+        const msg = String(row.msg || row.message || "").replace(/^Value error,\s*/i, "");
+        if (msg && loc) return `${loc}: ${msg}`;
+        return msg || loc;
+      }
+      return "";
+    }).filter(Boolean);
+    if (parts.length) return parts.join("; ");
+  }
+  if (detail && typeof detail === "object" && "msg" in detail) {
+    return String((detail as { msg: unknown }).msg || "");
+  }
+  return "";
 }
 
 export function sessionToken(): string | null {
@@ -68,7 +94,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const detail = data.detail;
-    const msg = typeof detail === "string" ? detail : `Request failed (${res.status})`;
+    const msg = formatDetail(detail) || `Request failed (${res.status})`;
     throw new ApiError(res.status, msg);
   }
   return data as T;
@@ -82,11 +108,12 @@ export const api = {
   token: (contract: string) => request<TokenDetail>(`/api/tokens/${encodeURIComponent(contract)}`),
   candles: (contract: string) =>
     request<{ candles: Candle[]; source: string }>(`/api/tokens/${encodeURIComponent(contract)}/candles`),
-  buy: (contract: string, amount_usd: number) =>
-    request<{ symbol: string; tokens: number; price: number; fee: number; balance: number }>(
+  buy: (contract: string, amount_usd: number, plan?: Partial<ExitPlan> & { preset?: string }) =>
+    request<{ symbol: string; tokens: number; price: number; fee: number; balance: number; exit_plan?: ExitPlan }>(
       "/api/trade/buy",
-      { method: "POST", body: JSON.stringify({ contract, amount_usd }) },
+      { method: "POST", body: JSON.stringify({ contract, amount_usd, ...(plan || {}) }) },
     ),
+  mood: () => request<{ mood: MarketMood | null; discipline: { breaks: number; break_cost: number; overrides: number; break_pnl?: number }; presets: Record<string, ExitPlan> }>("/api/mood"),
   sell: (contract: string, percent: number) =>
     request<{ symbol: string; received: number; realized: number; closed: boolean; balance: number }>(
       "/api/trade/sell",
