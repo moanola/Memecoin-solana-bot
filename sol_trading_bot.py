@@ -213,6 +213,10 @@ _user_locks:        dict = {}  # asyncio.Lock per uid — prevents concurrent bu
 
 from persistence import load_all, save_user, save_trade_log, autosave_job, register_state
 from access import access_allowed as _access_allowed_pure, make_gate as _make_gate
+from text_safety import (
+    md_escape, llm_safe, llm_safe_list, build_llm_user_prompt,
+    LLM_SYSTEM_PROMPT, merge_advisory_verdict,
+)
 _http: httpx.AsyncClient | None = None
 
 async def get_http() -> httpx.AsyncClient:
@@ -3381,8 +3385,8 @@ def _safe_dt(val) -> datetime:
 
 
 def _md(text) -> str:
-    """Escape underscores and asterisks in user-controlled strings for Telegram Markdown."""
-    return str(text or "").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    """Escape user/token-controlled strings for Telegram legacy Markdown (_ * ` [)."""
+    return md_escape(text or "")
 
 
 def age_str(h: float) -> str:
@@ -4678,7 +4682,7 @@ async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if card:
         await update.message.reply_photo(
             photo=card,
-            caption="📸 *$" + match_rec.get("symbol", "?") + "* — *" + _fmt_x_or_pct(x_val) + "* since first call",
+            caption="📸 *$" + _md(match_rec.get("symbol", "?")) + "* — *" + _fmt_x_or_pct(x_val) + "* since first call",
             parse_mode="Markdown",
         )
     else:
@@ -6463,19 +6467,25 @@ async def ai_analyze_token(info: dict, sc: dict, ud: dict, uid: int = 0) -> dict
     if api_key and verdict != "SKIP":
         try:
             history_ctx = _build_history_context(ud, uid)
-            prompt = (
-                f"Token: ${symbol} | MC: {mc_str(mc)} | Age: {age_h}h | Score: {score}/100\n"
-                f"LP: {lp_burn}% burned | Mint: {'disabled' if no_mint else 'ACTIVE'} | Buy%: {buy_pct}%\n"
-                f"Flags: {'; '.join(flags) or 'None'} | Strengths: {'; '.join(strengths[:3]) or 'None'}\n"
-                f"Curve: {pf_curve}% | Insiders: {insider}% | Top10: {top10}%\n"
-                f"Socials: TW={'yes' if info.get('twitter') else 'no'} TG={'yes' if info.get('telegram') else 'no'}\n"
-                f"History: {history_ctx}\n\n"
-                "Give a 2-sentence sniper verdict. Reply ONLY in JSON:\n"
-                '{"verdict":"SNIPE"|"SKIP"|"WAIT","confidence":<1-10>,"thesis":"<2 sentences>",'
-                f'"suggested_amount":<float max {max_buy}>,"red_flags":[],"green_flags":[],'
-                '"rug_risk":"LOW"|"MEDIUM"|"HIGH","momentum":"STRONG"|"MODERATE"|"WEAK"|"NEGATIVE",'
-                '"social_score":"GOOD"|"PARTIAL"|"NONE"}'
-            )
+            # Token-controlled strings are untrusted: sanitise, length-limit and
+            # pass them as JSON inside explicit <token_data> delimiters.
+            _fields = {
+                "symbol":     llm_safe(symbol, 24),
+                "market_cap": mc_str(mc),
+                "age_h":      age_h,
+                "score":      score,
+                "lp_burned_pct": lp_burn,
+                "mint_authority": "disabled" if no_mint else "ACTIVE",
+                "buy_pct":    buy_pct,
+                "flags":      llm_safe_list(flags, 6, 80),
+                "strengths":  llm_safe_list(strengths[:3], 3, 80),
+                "pumpfun_curve_pct": pf_curve,
+                "insider_pct": insider,
+                "top10_pct":  top10,
+                "socials":    {"twitter": bool(info.get("twitter")), "telegram": bool(info.get("telegram"))},
+                "history":    llm_safe(history_ctx, 600),
+            }
+            prompt = build_llm_user_prompt(_fields, max_buy)
             # Rate limit
             now_ts = datetime.now().timestamp()
             if not hasattr(ai_analyze_token, "_call_times"):
@@ -6487,17 +6497,25 @@ async def ai_analyze_token(info: dict, sc: dict, ud: dict, uid: int = 0) -> dict
                 resp = await client.post(
                     "https://api.anthropic.com/v1/messages",
                     headers={"Content-Type":"application/json","x-api-key":api_key,"anthropic-version":"2023-06-01"},
-                    json={"model":"claude-haiku-4-5-20251001","max_tokens":400,
-                      "system":"You are a Solana memecoin sniper AI. Respond ONLY with valid JSON, no markdown.",
+                    json={"model": ANTHROPIC_MODEL, "max_tokens":400,
+                      "system": LLM_SYSTEM_PROMPT,
                       "messages":[{"role":"user","content":prompt}]},
                     timeout=12.0
                 )
                 if resp.status_code == 200:
                     raw  = resp.json()["content"][0]["text"].strip().replace("```json","").replace("```","")
-                    result = _json.loads(raw)
-                    if result.get("verdict") in ("SNIPE","SKIP","WAIT"):
-                        result["suggested_amount"] = min(float(result.get("suggested_amount", suggested)), max_buy, bal)
-                        return result
+                    llm_result = _json.loads(raw)
+                    # Advisory only: the LLM can make the rule-based verdict more
+                    # conservative, never more aggressive (no SKIP/WAIT -> SNIPE).
+                    rule_result = {
+                        "verdict": verdict, "confidence": confidence,
+                        "suggested_amount": suggested, "thesis": thesis,
+                        "red_flags": red_flags[:4], "green_flags": green_flags[:4],
+                        "rug_risk": rug_risk, "momentum": momentum, "social_score": social_score,
+                    }
+                    merged = merge_advisory_verdict(rule_result, llm_result, max_buy, bal)
+                    if merged:
+                        return merged
         except Exception as _ai_err:
             logger.debug(f"AI call skipped (using rule-based): {_ai_err}")
 
@@ -7052,7 +7070,7 @@ async def kol_tracker_job(ctx: ContextTypes.DEFAULT_TYPE):
                                 "━━━━━━━━━━━━━━━━━━\n"
                                 "🏷 *" + wallet_label + "*\n"
                                 "`" + wallet_addr[:20] + "...`\n\n"
-                                "🪙 *$" + info["symbol"] + "*  ·  " + info.get("chain","?").upper() + "\n"
+                                "🪙 *$" + _md(info["symbol"]) + "*  ·  " + info.get("chain","?").upper() + "\n"
                                 "`" + mint + "`\n\n"
                                 "💰 Bought: *" + str(sol) + " SOL* (~$" + f"{usd_est:,.0f}" + ")\n"
                                 "📊 MC: *" + mc_str(info["mc"]) + "*  ·  Age: *" + str(round(info.get("age_h",0),1)) + "h*\n"
@@ -10729,7 +10747,7 @@ async def apex_post_exit_tracker_run(app, uid: int) -> None:
                         reply_markup=_kb,
                         text=(
                             "📈 *POST-EXIT INSIGHT*\n\n"
-                            "*$" + rec.get("symbol","?") + "*  " + info.get("chain","SOL").upper() + "\n"
+                            "*$" + _md(rec.get("symbol","?")) + "*  " + info.get("chain","SOL").upper() + "\n"
                             "─────────────────────\n"
                             + _exit_icon + " Exit: *" + exit_r + "*  at  *" + str(exit_x) + "x*"
                             + ("  |  Held *" + str(round(held_h, 1)) + "h*" if held_h else "") + "\n"
@@ -10899,7 +10917,7 @@ async def apex_watchlist_checker(app) -> None:
                         chat_id=uid, parse_mode="Markdown",
                         text=(
                             "\U0001f441 *WATCHLIST \u2014 REVERSAL DETECTED*\n\n"
-                            "*$" + rec.get("symbol","?") + "*\n\n"
+                            "*$" + _md(rec.get("symbol","?")) + "*\n\n"
                             "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
                             "Original exit: *" + rec.get("exit_reason","?").replace("apex_","").replace("_"," ").title() + "* at *" + str(rec.get("exit_x","?")) + "x*\n"
                             "Time since exit: *" + str(age_h) + "h*\n\n"
@@ -12379,9 +12397,9 @@ async def do_buy_msg(update, ud, uid, contract, amount, mood=""):
     liq_warn = "\n\nWARNING: LOW LIQUIDITY" if info["liq"] < 50_000 else ""
     await msg.edit_text(
         "✅ *BUY EXECUTED*\n\n"
-        "*" + info["name"] + " ($" + info["symbol"] + ")*\n"
+        "*" + _md(info["name"]) + " ($" + _md(info["symbol"]) + ")*\n"
         "Spent: *" + money(amount) + "*\n"
-        "Got: *" + str(round(tokens, 4)) + " " + info["symbol"] + "*\n"
+        "Got: *" + str(round(tokens, 4)) + " " + _md(info["symbol"]) + "*\n"
         "Price: *" + money(info["price"]) + "*\n"
         "MC: *" + mc_str(info["mc"]) + "*\n"
         "Liq: *" + money(info["liq"]) + "*\n"
@@ -12415,9 +12433,9 @@ async def do_buy_query(q, ud, uid, contract, amount, mood=""):
     liq_warn = "\n\nWARNING: LOW LIQUIDITY" if info["liq"] < 50_000 else ""
     await q.edit_message_text(
         "✅ *BUY EXECUTED*\n\n"
-        "*" + info["name"] + " ($" + info["symbol"] + ")*\n"
+        "*" + _md(info["name"]) + " ($" + _md(info["symbol"]) + ")*\n"
         "Spent: *" + money(amount) + "*\n"
-        "Got: *" + str(round(tokens, 4)) + " " + info["symbol"] + "*\n"
+        "Got: *" + str(round(tokens, 4)) + " " + _md(info["symbol"]) + "*\n"
         "Price: *" + money(info["price"]) + "*\n"
         "MC: *" + mc_str(info["mc"]) + "*\n"
         "Liq: *" + money(info["liq"]) + "*\n"
@@ -12883,7 +12901,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 targets.sort(key=lambda t: t["x"])
                 ud["holdings"][contract]["auto_sells"] = targets
                 h = ud["holdings"][contract]
-                lines = ["✅ *Auto-sells set for $" + h["symbol"] + "*\n"]
+                lines = ["✅ *Auto-sells set for $" + _md(h["symbol"]) + "*\n"]
                 for t in targets:
                     lines.append("  " + str(int(t["pct"]*100)) + "% at " + str(t["x"]) + "x  (~" + money(h["avg_price"] * t["x"]) + ")")
                 pending.pop(u.id, None)
@@ -12979,7 +12997,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 })
                 pending.pop(u.id, None)
                 await update.message.reply_text(
-                    "✅ *Limit Sell Set*\n\nSell " + money(amount) + " of $" + h["symbol"] + " when price hits " + money(target_price),
+                    "✅ *Limit Sell Set*\n\nSell " + money(amount) + " of $" + _md(h["symbol"]) + " when price hits " + money(target_price),
                     parse_mode="Markdown", reply_markup=back_main()
                 )
             except Exception:
@@ -15921,7 +15939,7 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cx    = price / h["avg_price"] if h.get("avg_price", 0) > 0 else 0
         ppnl  = cv - h["total_invested"]
         await q.edit_message_text(
-            "🔴 *SELL $" + h["symbol"] + "*\n\n"
+            "🔴 *SELL $" + _md(h["symbol"]) + "*\n\n"
             "Value: *" + money(cv) + "*  |  *" + str(round(cx, 2)) + "x*\n"
             "PnL: " + pstr(ppnl) + "\n\nHow much to sell?",
             parse_mode="Markdown",
@@ -15940,7 +15958,7 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cx = price / h["avg_price"] if h["avg_price"] > 0 else 0
         ppnl = cv - h["total_invested"]
         await q.edit_message_text(
-            "🔴 *SELL $" + h["symbol"] + "*\n\n"
+            "🔴 *SELL $" + _md(h["symbol"]) + "*\n\n"
             "Value: *" + money(cv) + "*\n"
             "Current: *" + str(round(cx, 2)) + "x*\n"
             "PnL: " + pstr(ppnl) + "\n\nHow much to sell?",
@@ -16320,7 +16338,7 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         h = ud["holdings"][contract]
         avg = h["avg_price"]
         await q.edit_message_text(
-            "🎯 *AUTO-SELL  $" + h["symbol"] + "*\n\nBuy price: " + money(avg) + "\n\nChoose a preset:",
+            "🎯 *AUTO-SELL  $" + _md(h["symbol"]) + "*\n\nBuy price: " + money(avg) + "\n\nChoose a preset:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("50% at 2x + 100% at 5x",          callback_data="asq_2_5_"   + contract)],
@@ -16503,7 +16521,7 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sl = h.get("stop_loss_pct")
         sl_info = "  Current: " + str(sl) + "%" if sl else ""
         await q.edit_message_text(
-            "🛑 *STOP LOSS  $" + h["symbol"] + "*" + sl_info + "\n\nSell ALL if price drops by:",
+            "🛑 *STOP LOSS  $" + _md(h["symbol"]) + "*" + sl_info + "\n\nSell ALL if price drops by:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("25%", callback_data="sls_25_" + contract),
@@ -18962,7 +18980,7 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             age_h     = round((now_ts - rec.get("exit_at", now_ts)) / 3600, 1)
             expires_h = round(max(0, (WATCHLIST_EXPIRY_S - (now_ts - rec.get("exit_at", now_ts))) / 3600), 1)
             icon      = status_icons.get(rec.get("status","watching"), "\U0001f535")
-            lines.append(icon + " *$" + rec.get("symbol","?") + "*  Exit: *" + str(rec.get("exit_x","?")) + "x*  (" + rec.get("exit_reason","?").replace("apex_","").replace("_"," ") + ")\n  Age: *" + str(age_h) + "h*  \u00b7  Expires in: *" + str(expires_h) + "h*\n")
+            lines.append(icon + " *$" + _md(rec.get("symbol","?")) + "*  Exit: *" + str(rec.get("exit_x","?")) + "x*  (" + rec.get("exit_reason","?").replace("apex_","").replace("_"," ") + ")\n  Age: *" + str(age_h) + "h*  \u00b7  Expires in: *" + str(expires_h) + "h*\n")
         await q.edit_message_text(
             "\n".join(lines), parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -19503,7 +19521,7 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines_p = ["*PENDING ACCESS REQUESTS*\n"]
         for pid, info in _pending_access.items():
             lines_p.append(
-                "• " + info.get("name","?") + " " + info.get("username","") +
+                "• " + _md(info.get("name","?")) + " " + _md(info.get("username","")) +
                 " — `" + str(pid) + "`\n  /admin approve " + str(pid)
             )
         await update.message.reply_text("\n".join(lines_p), parse_mode="Markdown")
@@ -19714,7 +19732,10 @@ def _register_persistence_state() -> None:
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # SafeMarkdownBot resends as plain text if Telegram rejects Markdown built
+    # from token-controlled strings (see safe_bot.py).
+    from safe_bot import SafeMarkdownBot
+    app = Application.builder().bot(SafeMarkdownBot(token=BOT_TOKEN)).build()
     _register_handlers(app)
 
     app.job_queue.run_repeating(checker_job,           interval=PRICE_CHECK_INTERVAL,       first=10)
