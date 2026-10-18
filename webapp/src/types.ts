@@ -25,6 +25,28 @@ export interface Rug {
   rate_limited: boolean;
 }
 
+export interface ExitPlan {
+  preset: string;
+  tp_x: number;
+  tp_pct: number;
+  invalidation_pct: number;
+  time_stop_min: number;
+}
+
+export interface MarketMood {
+  label: string;
+  score: number;
+  size_mult: number;
+  heat_scale: number;
+  fees_usd: number | null;
+  volume_usd: number | null;
+  share_7d_pct: number | null;
+  day: string | null;
+  source: string;
+  attribution: string;
+  paper: boolean;
+}
+
 export interface FeedToken {
   contract: string;
   symbol: string;
@@ -41,6 +63,21 @@ export interface FeedToken {
   verdict: string;
   image: string;
   flags: string[];
+  pair_label?: string;
+  quote_symbol?: string;
+  quote_kind?: string;
+  price_indicative?: boolean;
+  copycat_role?: string;
+  copycat_label?: string;
+  launch_group_sold_pct?: number | null;
+  launch_group_size?: number | null;
+  dev_cashout?: boolean;
+  rug_memory_note?: string;
+  holders_per_hour?: number | null;
+  holder_retention_pct?: number | null;
+  kol_exit_note?: string;
+  fee_sweep?: boolean;
+  multi_hop_txs?: number | null;
 }
 
 export interface AiVerdict {
@@ -64,7 +101,15 @@ export interface TokenDetail extends FeedToken {
   strengths: string[];
   rug: Rug;
   ai?: AiVerdict;
-  position: { amount: number; cost: number; value: number; pnl: number; avg_price: number } | null;
+  position: {
+    amount: number;
+    cost: number;
+    value: number;
+    pnl: number;
+    avg_price: number;
+    exit_plan?: ExitPlan | null;
+  } | null;
+  dev_cashout_reason?: string;
   slippage: { sample_usd: number; slippage_pct: number; cost_usd: number } | null;
 }
 
@@ -92,6 +137,7 @@ export interface Position {
   pnl_pct: number;
   x: number;
   mood: string;
+  exit_plan?: ExitPlan | null;
   mc: number;
   liq: number;
 }
@@ -128,6 +174,7 @@ export interface ApexStatus {
   phase: string;
   balance: number | null;
   buy_amount: number;
+  mood?: MarketMood | null;
 }
 
 export interface BoardRow {

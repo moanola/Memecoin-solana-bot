@@ -54,6 +54,20 @@ export function Apex({ onChanged }: { onChanged: () => void }) {
             {status.enabled ? "Disable" : "Enable"}
           </button>
         </div>
+        {status.mood && (
+          <div className="mt-4 rounded-xl border border-line p-3">
+            <div className="text-[11px] uppercase tracking-wider text-mute">Market mood</div>
+            <div className="mt-1 flex items-baseline justify-between">
+              <span className="text-lg font-semibold">{status.mood.label}</span>
+              <span className="num text-cyan">{status.mood.score}</span>
+            </div>
+            <div className="mt-1 text-xs text-mute num">
+              size ×{status.mood.size_mult} · heat ×{status.mood.heat_scale}
+              {status.mood.share_7d_pct != null ? ` · pump.fun ${status.mood.share_7d_pct.toFixed(1)}%` : ""}
+            </div>
+            <div className="mt-1 text-[10px] text-mute">{status.mood.attribution}</div>
+          </div>
+        )}
         <div className="mt-4 text-[11px] uppercase tracking-wider text-mute">Capital heat {heat.toFixed(0)}%</div>
         <div className="mt-1 h-2 rounded-full bg-panel2 overflow-hidden">
           <div className="h-full bg-cyan" style={{ width: `${heat}%` }} />

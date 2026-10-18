@@ -1,0 +1,7 @@
+{
+  "columns": ["pad", "share_7d_pct"],
+  "rows": [
+    {"pad": "pump-fun", "share_7d_pct": 50.22},
+    {"pad": "other", "share_7d_pct": 10.0}
+  ]
+}

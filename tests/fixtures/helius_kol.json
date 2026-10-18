@@ -1,0 +1,54 @@
+[
+  {
+    "signature": "sellsig",
+    "type": "SWAP",
+    "timestamp": 200,
+    "slot": 20,
+    "feePayer": "KolWallet111111111111111111111111111111111",
+    "tokenTransfers": [
+      {
+        "mint": "MintAAA111111111111111111111111111111111111",
+        "tokenAmount": 40,
+        "fromUserAccount": "KolWallet111111111111111111111111111111111",
+        "toUserAccount": "Pool"
+      }
+    ],
+    "nativeTransfers": [
+      {"amount": 500000000, "fromUserAccount": "Pool", "toUserAccount": "KolWallet111111111111111111111111111111111"}
+    ]
+  },
+  {
+    "signature": "airdropsig",
+    "type": "TRANSFER",
+    "timestamp": 150,
+    "slot": 15,
+    "feePayer": "Someone",
+    "tokenTransfers": [
+      {
+        "mint": "MintBBB111111111111111111111111111111111111",
+        "tokenAmount": 1000,
+        "fromUserAccount": "Airdropper",
+        "toUserAccount": "KolWallet111111111111111111111111111111111"
+      }
+    ],
+    "nativeTransfers": []
+  },
+  {
+    "signature": "buysig",
+    "type": "SWAP",
+    "timestamp": 100,
+    "slot": 10,
+    "feePayer": "KolWallet111111111111111111111111111111111",
+    "tokenTransfers": [
+      {
+        "mint": "MintAAA111111111111111111111111111111111111",
+        "tokenAmount": 100,
+        "fromUserAccount": "Pool",
+        "toUserAccount": "KolWallet111111111111111111111111111111111"
+      }
+    ],
+    "nativeTransfers": [
+      {"amount": 2000000000, "fromUserAccount": "KolWallet111111111111111111111111111111111", "toUserAccount": "Pool"}
+    ]
+  }
+]

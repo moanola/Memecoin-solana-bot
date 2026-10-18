@@ -3,7 +3,9 @@ import type {
   ApexStatus,
   BoardRow,
   Candle,
+  ExitPlan,
   FeedToken,
+  MarketMood,
   Me,
   Position,
   Tick,
@@ -82,11 +84,12 @@ export const api = {
   token: (contract: string) => request<TokenDetail>(`/api/tokens/${encodeURIComponent(contract)}`),
   candles: (contract: string) =>
     request<{ candles: Candle[]; source: string }>(`/api/tokens/${encodeURIComponent(contract)}/candles`),
-  buy: (contract: string, amount_usd: number) =>
-    request<{ symbol: string; tokens: number; price: number; fee: number; balance: number }>(
+  buy: (contract: string, amount_usd: number, plan?: Partial<ExitPlan> & { preset?: string }) =>
+    request<{ symbol: string; tokens: number; price: number; fee: number; balance: number; exit_plan?: ExitPlan }>(
       "/api/trade/buy",
-      { method: "POST", body: JSON.stringify({ contract, amount_usd }) },
+      { method: "POST", body: JSON.stringify({ contract, amount_usd, ...(plan || {}) }) },
     ),
+  mood: () => request<{ mood: MarketMood | null; discipline: { breaks: number; break_cost: number; overrides: number; break_pnl?: number }; presets: Record<string, ExitPlan> }>("/api/mood"),
   sell: (contract: string, percent: number) =>
     request<{ symbol: string; received: number; realized: number; closed: boolean; balance: number }>(
       "/api/trade/sell",

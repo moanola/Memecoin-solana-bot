@@ -75,6 +75,11 @@ class LoginBody(BaseModel):
 class BuyBody(BaseModel):
     contract: str = Field(min_length=8, max_length=128)
     amount_usd: float = Field(gt=0, le=10_000)
+    preset: str | None = None
+    tp_x: float | None = None
+    tp_pct: float | None = None
+    invalidation_pct: float | None = None
+    time_stop_min: float | None = None
 
 
 class SellBody(BaseModel):
@@ -163,6 +168,25 @@ def _public_token(contract: str, info: dict, sc: dict, ai: dict | None = None, s
         "source": source,
         "ts": time.time(),
         "paper": True,
+        "quote_symbol": info.get("quote_symbol") or "",
+        "quote_kind": info.get("quote_kind") or "",
+        "pair_label": info.get("pair_label") or "",
+        "price_indicative": bool(info.get("price_indicative")),
+        "price_derived": bool(info.get("price_derived")),
+        "multi_hop_txs": info.get("multi_hop_txs"),
+        "fee_sweep": bool(info.get("fee_sweep")),
+        "copycat_role": info.get("copycat_role") or "",
+        "copycat_label": info.get("copycat_label") or "",
+        "copycat_original_symbol": info.get("copycat_original_symbol") or "",
+        "launch_group_size": info.get("launch_group_size"),
+        "launch_group_sold_pct": info.get("launch_group_sold_pct"),
+        "launch_group_confident": bool(info.get("launch_group_confident")),
+        "dev_cashout": bool(info.get("dev_cashout")),
+        "dev_cashout_reason": info.get("dev_cashout_reason") or "",
+        "rug_memory_note": info.get("rug_memory_note") or "",
+        "holders_per_hour": info.get("holders_per_hour"),
+        "holder_retention_pct": info.get("holder_retention_pct"),
+        "kol_exit_note": info.get("kol_exit_note") or "",
     }
     if ai:
         out["ai"] = {
@@ -324,6 +348,7 @@ async def _position_rows(ud: dict) -> list[dict]:
             "pnl_pct": round((pnl / cost * 100), 2) if cost else 0.0,
             "x": round(price / avg, 4) if avg else 0.0,
             "mood": h.get("mood") or "",
+            "exit_plan": h.get("exit_plan"),
             "bought_at": _iso(h.get("bought_at")),
             "liq": _num(info.get("liq")) if info else _num(h.get("liq_at_buy")),
             "mc": _num(info.get("mc")) if info else 0.0,
@@ -435,7 +460,19 @@ def _apex_payload(uid: int, ud: dict) -> dict:
         "balance": ud.get("balance"),
         "buy_amount": _num((ud.get("sniper_filters") or {}).get("buy_amount"), 20),
         "sniper_paused": bool(getattr(bot, "_admin_sniper_paused", False)),
+        "mood": _cached_mood(),
     }
+
+
+def _cached_mood():
+    try:
+        from edge.flags import market_mood
+        if not market_mood():
+            return None
+        from edge.mood import cached
+        return cached()
+    except Exception:
+        return None
 
 
 def _set_apex(uid: int, ud: dict, enabled: bool) -> None:
@@ -666,6 +703,11 @@ def create_app() -> FastAPI:
         info = await bot.get_token(contract)
         if not info:
             raise HTTPException(status_code=404, detail="Token not found on DexScreener")
+        try:
+            from edge.enrich import enrich_onchain
+            await enrich_onchain(contract, info)
+        except Exception:
+            logger.debug("token detail enrich failed", exc_info=True)
         sc = bot.sniper_score(info)
         ai = await bot.ai_analyze_token(info, sc, ud, uid)
         payload = _public_token(contract, info, sc, ai=ai, source="detail")
@@ -680,6 +722,7 @@ def create_app() -> FastAPI:
                 "value": round(value, 4),
                 "pnl": round(value - cost, 4),
                 "avg_price": _num(held.get("avg_price")),
+                "exit_plan": held.get("exit_plan"),
             }
         else:
             payload["position"] = None
@@ -735,11 +778,23 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="Set a starting balance with /start in Telegram first")
         contract = body.contract.strip()
         fees_before = _num(ud.get("total_fees_paid"))
+        plan = None
+        if any(v is not None for v in (body.preset, body.tp_x, body.tp_pct, body.invalidation_pct, body.time_stop_min)):
+            plan = {
+                "preset": body.preset,
+                "tp_x": body.tp_x,
+                "tp_pct": body.tp_pct,
+                "invalidation_pct": body.invalidation_pct,
+                "time_stop_min": body.time_stop_min,
+            }
         async with bot._get_user_lock(uid):
-            result = await bot.do_buy_core(ud, uid, contract, float(body.amount_usd), planned=True, mood="")
+            result = await bot.do_buy_core(
+                ud, uid, contract, float(body.amount_usd), planned=True, mood="", exit_plan=plan,
+            )
         if isinstance(result, str):
             raise HTTPException(status_code=400, detail=result)
         info, tokens = result
+        held = (ud.get("holdings") or {}).get(contract) or {}
         return {
             "paper": True,
             "ok": True,
@@ -753,6 +808,7 @@ def create_app() -> FastAPI:
             "balance": ud.get("balance"),
             "liq": info.get("liq"),
             "mc": info.get("mc"),
+            "exit_plan": held.get("exit_plan"),
         }
 
     @app.post("/api/trade/sell")
@@ -808,6 +864,33 @@ def create_app() -> FastAPI:
             "balance": ud.get("balance"),
             "auto_saved": result.get("auto_saved"),
         }
+
+    @app.get("/api/mood")
+    async def market_mood(user=Depends(current_user)):
+        """Mood gauge plus today's rule-break tally for this paper account."""
+        uid, ud = user
+        mood = _cached_mood()
+        try:
+            from edge.flags import market_mood as mood_on
+            if mood_on() and mood is None:
+                from edge.mood import refresh
+                mood = await refresh()
+        except Exception:
+            logger.debug("mood refresh failed", exc_info=True)
+        discipline = {"breaks": 0, "break_cost": 0, "overrides": 0, "rows": []}
+        presets = {}
+        try:
+            from edge.exit_plan import PRESETS, nightly_report
+            from edge.flags import exit_plan as plans_on
+            presets = PRESETS
+            if plans_on():
+                today = datetime.now(bot.BOT_TZ).date()
+                from datetime import time as dtime
+                start = datetime.combine(today, dtime.min, tzinfo=bot.BOT_TZ).timestamp()
+                discipline = nightly_report(ud, start)
+        except Exception:
+            logger.debug("discipline payload failed", exc_info=True)
+        return {"paper": True, "mood": mood, "discipline": discipline, "presets": presets, "uid": uid}
 
     @app.get("/api/apex")
     async def apex_status(user=Depends(current_user)):

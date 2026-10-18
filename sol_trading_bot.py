@@ -223,7 +223,7 @@ from text_safety import (
 )
 # HTTP client, SOL price and Helius helpers live in api_clients.py
 from api_clients import (
-    get_http, close_http, get_sol_price,
+    get_http, close_http, get_sol_price, get_quote_usd,
     get_helius_maker_pct, get_helius_pool_price, get_helius_rug_signal,
     get_helius_top_holders,
 )
@@ -405,7 +405,10 @@ _sniper_analysis_cache: dict = {}  # uid -> {contract -> {info, sc, ai}} for Vie
 # }}}
 _channel_calls: dict = {}
 _kol_last_sig:  dict = {}      # uid -> {wallet_addr -> last_sig}
-_kol_hot_contracts: dict = {}  # contract -> [{label, sol_spent, ts}] — KOL recent buys
+_kol_hot_contracts: dict = {}  # contract -> [{label, sol_spent, ts, side, via, bag_pct}]
+_kol_bags: dict = {}           # wallet -> {mint: token balance} for sell % of bag
+_kol_side_cache: dict = {}     # wallet -> {ts, funder, side_wallets} funding-source trace
+_kol_side_budget = {"n": 0}    # extra Helius calls allowed in one KOL cycle
 _first_scanner:       dict = {}  # contract -> {uid, username, price, mc, scanned_at}
 _ath_cache:           dict = {}  # contract -> {price, mc, ts}  — persists across refreshes
 _contract_scan_count: dict = {}  # contract -> int — how many times this CA was scanned
@@ -1629,6 +1632,21 @@ async def get_token(contract: str, force: bool = False, max_age: float | None = 
             return None
         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
         price = float(best.get("priceUsd") or 0)
+        _pair_meta = {}
+        try:
+            from edge.flags import custom_pairs as _custom_pairs_on
+            from edge.quotes import annotate_dex_pair
+            if _custom_pairs_on():
+                _qusd = None
+                _qaddr = (best.get("quoteToken") or {}).get("address") or ""
+                if price <= 0 and _qaddr:
+                    _qusd = await get_quote_usd(_qaddr)
+                _pair_meta = annotate_dex_pair(best, _qusd)
+                if price <= 0 and _pair_meta.get("derived_price_usd"):
+                    price = float(_pair_meta["derived_price_usd"])
+        except Exception as _pair_err:
+            logger.debug("custom pair annotate: %s", _pair_err)
+            _pair_meta = {}
         if not price:
             return None
         mc = float(best.get("marketCap") or best.get("fdv") or 0)
@@ -1997,6 +2015,7 @@ async def get_token(contract: str, force: bool = False, max_age: float | None = 
             "sells":    sells,
             "buy_pct":  buy_pct,
             "age_h":    age_h,
+            "pair_created_at": (pair_created / 1000.0) if pair_created else None,
             "twitter":   twitter,
             "telegram":  telegram,
             "website":   website,
@@ -2061,6 +2080,19 @@ async def get_token(contract: str, force: bool = False, max_age: float | None = 
             "top3_vol_pct": None,   # top 3 wallet % of volume (wash trade signal)
             # Boost spend (social attention proxy)
             "boost_amount": 0,      # total SOL spent boosting on DexScreener
+            # Custom pair / quote asset (empty when the feature flag is off)
+            "quote_symbol": _pair_meta.get("quote_symbol") or (best.get("quoteToken") or {}).get("symbol") or "",
+            "quote_address": _pair_meta.get("quote_address") or (best.get("quoteToken") or {}).get("address") or "",
+            "quote_kind": _pair_meta.get("quote_kind") or "",
+            "pair_label": _pair_meta.get("pair_label") or "",
+            "price_indicative": bool(_pair_meta.get("price_indicative")),
+            "price_derived": bool(_pair_meta.get("price_derived")),
+            "creator": (
+                rc_data.get("creator") if isinstance(rc_data, dict) and isinstance(rc_data.get("creator"), str)
+                else rc_data.get("creatorAddress") if isinstance(rc_data, dict) and isinstance(rc_data.get("creatorAddress"), str)
+                else None
+            ),
+            "creator_funder": None,
         }
 
         # ── Helius holder enrichment — overwrites RugCheck top10/holders_data ─
@@ -2086,6 +2118,12 @@ async def get_token(contract: str, force: bool = False, max_age: float | None = 
                     result["_holders_source"] = "helius_rpc"
             except Exception as _hhe:
                 logger.debug(f"Helius holder enrichment failed: {_hhe}")
+
+        try:
+            from edge.scoring import apply_local as _edge_apply_local
+            _edge_apply_local(result, contract)
+        except Exception as _edge_local_err:
+            logger.debug("edge local annotate: %s", _edge_local_err)
 
         _token_cache[contract] = {"data": result, "ts": _time.time()}
         return result
@@ -2492,17 +2530,39 @@ def sniper_score(info: dict) -> dict:
         score -= 2
 
     # ── CATEGORY 9: KOL SIGNAL BONUS (0–20 pts) ──────────────────────────────
+    # EDGE_KOL_EXITS scales this by kol_boost_factor (1 when the flag is off
+    # or no exit has been seen). An airdrop with no buy has factor 0.
     kol_count  = info.get("kol_buy_count", 0)
     kol_sol    = info.get("kol_sol_total", 0)
     kol_labels = info.get("kol_labels", [])
+    _kol_bonus = 0
+    _kol_note = ""
     if kol_count >= 2:
-        score += 20; strengths.append(f"👀 {kol_count} KOL wallets bought ({kol_sol:.1f} SOL)")
+        _kol_bonus = 20
+        _kol_note = f"👀 {kol_count} KOL wallets bought ({kol_sol:.1f} SOL)"
     elif kol_count == 1:
         _kl = kol_labels[0] if kol_labels else "KOL wallet"
         if kol_sol >= 1.0:
-            score += 15; strengths.append(f"👀 {_kl} bought {kol_sol:.1f} SOL")
+            _kol_bonus = 15
+            _kol_note = f"👀 {_kl} bought {kol_sol:.1f} SOL"
         else:
-            score += 8;  strengths.append(f"👀 KOL wallet entry detected")
+            _kol_bonus = 8
+            _kol_note = "👀 KOL wallet entry detected"
+    if _kol_bonus:
+        try:
+            from edge.flags import kol_exits as _kol_exit_on
+            from edge.kol import boost_points as _kol_boost_points
+            if _kol_exit_on():
+                _raw_factor = info.get("kol_boost_factor", 1.0)
+                _factor = 1.0 if _raw_factor is None else float(_raw_factor)
+            else:
+                _factor = 1.0
+        except Exception:
+            _factor = 1.0
+        _applied = int(round(_kol_bonus * max(0.0, min(1.0, _factor))))
+        if _applied:
+            score += _applied
+            strengths.append(_kol_note if _factor > 0.99 else _kol_note + f" (boost {int(_factor*100)}%)")
 
     # ── CATEGORY 10: CHAIN-SPECIFIC AGE ADJUSTMENT ───────────────────────────
     _chain_low = info.get("chain", "").lower()
@@ -2550,6 +2610,13 @@ def sniper_score(info: dict) -> dict:
     score = min(score + 0, 100)   # re-apply cap after social bonus
 
     score = min(score, 100)
+
+    try:
+        from edge.scoring import adjust as _edge_adjust
+        score, strengths, warnings, flags = _edge_adjust(info, score, strengths, warnings, flags)
+        flag_count = len(flags)
+    except Exception as _edge_score_err:
+        logger.debug("edge score adjust: %s", _edge_score_err)
 
     # ── Verdict ───────────────────────────────────────────────────────────────
     if flag_count >= 2:
@@ -2669,6 +2736,18 @@ def score_token(info: dict) -> dict:
         score = max(0, score - 10)
     if buy_pct < 40:
         score = max(0, score - 5)
+
+    try:
+        from edge.scoring import adjust as _edge_adjust_manual
+        _edge_flags: list = []
+        score, strengths, warnings, _edge_flags = _edge_adjust_manual(
+            info, score, strengths, warnings, _edge_flags
+        )
+        for _ef in _edge_flags:
+            if _ef not in warnings:
+                warnings.append(_ef)
+    except Exception as _edge_manual_err:
+        logger.debug("edge manual score: %s", _edge_manual_err)
 
     score = min(score, 100)
 
@@ -3230,6 +3309,13 @@ def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reaso
     # Nothing additional needed here.
     if closed:
         pass  # vault already credited above
+    try:
+        from edge.flags import exit_plan as _exit_plan_on
+        if _exit_plan_on() and reason == "manual":
+            from edge.exit_plan import note_early_sell
+            note_early_sell(ud, h, price, realized, reason)
+    except Exception as _rule_err:
+        logger.debug("rule break log: %s", _rule_err)
     save_user(uid, ud)
     if closed:
         save_trade_log(uid, trade_log.get(uid, []))
@@ -3273,6 +3359,14 @@ _GMGN_CHAIN_MAP: dict = {
     "bsc":"bsc","bnb":"bsc","base":"base",
     "robinhood":"robinhood","ton":"ton",
 }
+
+def _edge_card_lines(info: dict) -> str:
+    try:
+        from edge.card import lines as _edge_lines
+        return _edge_lines(info)
+    except Exception:
+        return ""
+
 
 def _card_stats_block(info: dict, contract: str, first_scan_line: str = "", show_mtv: bool = False) -> str:
     """
@@ -3487,6 +3581,7 @@ def _card_stats_block(info: dict, contract: str, first_scan_line: str = "", show
         + x_line
         + "\n"
         + ext_line
+        + _edge_card_lines(info)
     )
 
 
@@ -4236,16 +4331,53 @@ async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
 
+async def _market_mood_text() -> str:
+    """Gauge used by /stats. Empty when the flag is off or nothing has loaded."""
+    try:
+        from edge.flags import market_mood as _on
+        if not _on():
+            return ""
+        from edge.mood import cached, refresh
+        mood = cached() or await refresh()
+    except Exception as exc:
+        logger.debug("mood text: %s", exc)
+        return ""
+    if not mood or mood.get("label") in {None, "OFF"}:
+        return ""
+    share = mood.get("share_7d_pct")
+    share_s = f"{float(share):.1f}%" if isinstance(share, (int, float)) else "n/a"
+    fees = mood.get("fees_usd")
+    vol = mood.get("volume_usd")
+
+    def _usd(value):
+        if not isinstance(value, (int, float)):
+            return "n/a"
+        if abs(value) >= 1_000_000:
+            return f"${value/1_000_000:.2f}M"
+        if abs(value) >= 1_000:
+            return f"${value/1_000:.1f}K"
+        return f"${value:.0f}"
+
+    return (
+        "🌡 *Market mood* " + str(mood.get("label")) + " · " + str(mood.get("score")) + "\n"
+        "pump.fun fees " + _usd(fees) + " · volume " + _usd(vol) + " · share " + share_s + "\n"
+        "APEX size ×" + str(mood.get("size_mult")) + " · heat ×" + str(mood.get("heat_scale")) + "\n"
+        "_" + str(mood.get("attribution") or "") + "_"
+    )
+
+
 async def cmd_user_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/stats <@username> — one caller's call history in this group."""
+    """/stats shows the market-mood gauge. `/stats @username` is the group caller card."""
     chat = update.effective_chat
-    if not chat or chat.type not in ("group", "supergroup"):
-        if update.message:
-            await update.message.reply_text("📊 Stats only work inside group chats.")
+    if not chat or not update.message:
         return
     args = ctx.args or []
-    if not args:
-        await update.message.reply_text("Usage: `/stats @username`", parse_mode="Markdown")
+    mood = await _market_mood_text()
+    if chat.type not in ("group", "supergroup") or not args:
+        text = mood or "Market mood is off or still loading. Set EDGE_MARKET_MOOD and try again."
+        if chat.type in ("group", "supergroup") and not args:
+            text += "\n\nCaller history: `/stats @username`"
+        await update.message.reply_text(text, parse_mode="Markdown")
         return
     query = args[0].lstrip("@").lower()
     results = _group_leaderboard_results(chat.id, "1d")
@@ -4255,9 +4387,12 @@ async def cmd_user_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "No calls found for @" + query + " in the last 1D window.\n"
             "They need to paste a CA in this group first."
+            + (("\n\n" + mood) if mood else "")
         )
         return
     text = _format_user_stats_text(match, "1d")
+    if mood:
+        text += "\n\n" + mood
     kb   = _ustat_period_kb(chat.id, match["uid"], "1d")
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
@@ -5015,6 +5150,33 @@ async def run_checker(app: Application):
             if h.get("mood") in ("APEX", "AI-Sniper", "APEX-DCA"):
                 continue
 
+            if h.get("exit_plan"):
+                try:
+                    from edge.exit_plan import evaluate as _eval_exit
+                    from edge.flags import exit_plan as _exit_on
+                    _why = _eval_exit(h.get("exit_plan"), h, price) if _exit_on() else None
+                except Exception:
+                    _why = None
+                if _why and contract in ud["holdings"]:
+                    cv = h["amount"] * price
+                    result = sell_core(ud, uid, contract, cv, price, "exit_" + _why)
+                    _label = {"tp": "TAKE PROFIT", "invalidation": "INVALIDATION", "time_stop": "TIME STOP"}.get(_why, _why)
+                    try:
+                        await app.bot.send_message(
+                            chat_id=uid, parse_mode="Markdown",
+                            text=(
+                                "📋 *EXIT PLAN — " + _label + "*\n\n"
+                                "*$" + _md(h["symbol"]) + "*\n"
+                                "Sold: *" + money(result["received"]) + "*\n"
+                                "PnL: *" + pstr(result["realized"]) + "*\n"
+                                "Cash: *" + money(ud["balance"]) + "*"
+                            ),
+                            reply_markup=main_menu_kb(),
+                        )
+                    except Exception as _epe:
+                        logger.debug("exit plan notify: %s", _epe)
+                    continue
+
             sl = h.get("stop_loss_pct")
             if sl:
                 drop = (price - avg) / avg * 100
@@ -5374,6 +5536,20 @@ async def daily_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
         # Keep 365 days
         if len(ud["equity_history"]) > 365:
             ud["equity_history"] = ud["equity_history"][-365:]
+        try:
+            from edge.flags import exit_plan as _exit_on
+            if _exit_on():
+                from datetime import time as _dtime
+                from edge.exit_plan import format_report, nightly_report
+                _day_start = datetime.combine(today, _dtime.min, tzinfo=BOT_TZ).timestamp()
+                _rule_text = format_report(nightly_report(ud, _day_start))
+                if _rule_text:
+                    await ctx.bot.send_message(
+                        chat_id=uid, parse_mode="Markdown", text=_rule_text,
+                        reply_markup=main_menu_kb(),
+                    )
+        except Exception as _rule_err:
+            logger.debug("rule-break report: %s", _rule_err)
         # ── Daily challenge check ─────────────────────────────────────────────
         if ud.get("challenge") and not ud["challenge"].get("ended"):
             try:
@@ -6604,6 +6780,161 @@ async def get_kol_recent_buys(wallet: str, helius_key: str, last_sig: str | None
         return []
 
 
+async def _helius_address_txns(wallet: str, helius_key: str, limit: int = 20, typ: str | None = None) -> list:
+    """One Helius enhanced-tx page. typ=None fetches every type (buys, sells, transfers)."""
+    if not helius_key:
+        return []
+    try:
+        client = await get_http()
+        params: dict = {"api-key": helius_key, "limit": str(limit)}
+        if typ:
+            params["type"] = typ
+        url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+        response = await client.get(url, params=params, timeout=8)
+        if response.status_code == 429:
+            logger.info("Helius KOL rate limit — skipping this cycle")
+            return []
+        if response.status_code != 200:
+            return []
+        body = response.json()
+        return body if isinstance(body, list) else []
+    except Exception as exc:
+        logger.debug("Helius address txns %s: %s", wallet[:8], exc)
+        return []
+
+
+async def get_kol_wallet_events(wallet: str, helius_key: str, last_sig: str | None = None) -> list:
+    """Newest-first buy/sell/transfer events, with bag percent filled from the ledger."""
+    txns = await _helius_address_txns(wallet, helius_key, limit=20, typ=None)
+    if not txns:
+        return []
+    try:
+        from edge.kol import apply_bag_ledger, parse_wallet_transactions
+    except Exception as exc:
+        logger.debug("KOL parser unavailable: %s", exc)
+        return []
+    events = parse_wallet_transactions(txns, wallet, last_sig)
+    if not events:
+        return []
+    ledger = _kol_bags.setdefault(wallet, {})
+    apply_bag_ledger(ledger, list(reversed(events)))
+    return events
+
+
+def _record_kol_hot(label: str, ev: dict) -> None:
+    mint = ev.get("mint") or ""
+    if not mint:
+        return
+    _kol_hot_contracts.setdefault(mint, []).append({
+        "label": label,
+        "sol_spent": ev.get("sol_spent") or 0,
+        "ts": _time.time(),
+        "side": ev.get("side") or "buy",
+        "via": ev.get("via") or "swap",
+        "bag_pct": ev.get("bag_pct"),
+        "wallet": ev.get("wallet"),
+        "side_wallet": bool(ev.get("side_wallet")),
+    })
+    _kol_hot_contracts[mint] = [
+        e for e in _kol_hot_contracts[mint]
+        if _time.time() - e.get("ts", 0) < 7200
+    ][-10:]
+
+
+async def _notify_kol_non_buy(ctx, uid: int, label: str, ev: dict) -> None:
+    mint = ev.get("mint") or ""
+    try:
+        if ev.get("side") == "sell":
+            pct = ev.get("bag_pct")
+            if pct is None:
+                size = "bag % unknown"
+            elif float(pct) >= 95:
+                size = f"full exit ({float(pct):.0f}% of bag)"
+            else:
+                size = f"partial ({float(pct):.0f}% of bag)"
+            sol = ev.get("sol_received") or 0
+            text = (
+                "🔻 *KOL SELL*\n"
+                "🏷 *" + _md(label) + "*\n"
+                "`" + mint + "`\n"
+                "Sold: *" + size + "*\n"
+                + (("SOL in: *" + str(sol) + "*\n") if sol else "")
+                + "_Score boost decays with the bag still held._\n"
+                + "[Solscan](https://solscan.io/tx/" + str(ev.get("signature") or "") + ")"
+            )
+        else:
+            text = (
+                "🎁 *KOL AIRDROP — not a buy*\n"
+                "🏷 *" + _md(label) + "* received tokens by transfer.\n"
+                "`" + mint + "`\n"
+                "_No score boost. Airdrops are a copytrade bait pattern._"
+            )
+        await ctx.bot.send_message(
+            chat_id=uid, parse_mode="Markdown", text=text, disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.debug("KOL non-buy alert: %s", exc)
+
+
+async def _trace_kol_sides(wallet: str, label: str, helius_key: str) -> None:
+    """Funding-source trace, cached 6h, plus at most one side-wallet swap check per cycle.
+
+    A shared SOL funder is not a proven identity link. Side-wallet buys are
+    labelled so the score can see them, and they are not treated as the KOL.
+    """
+    if _kol_side_budget["n"] >= 2:
+        return
+    now = _time.time()
+    cached = _kol_side_cache.get(wallet)
+    if not cached or now - float(cached.get("ts") or 0) >= 6 * 3600:
+        _kol_side_budget["n"] += 1
+        txns = await _helius_address_txns(wallet, helius_key, limit=20, typ="TRANSFER")
+        transfers = []
+        for tx in txns:
+            for native in tx.get("nativeTransfers") or []:
+                try:
+                    sol = abs(float(native.get("amount") or 0)) / 1e9
+                except (TypeError, ValueError):
+                    continue
+                transfers.append({
+                    "from": native.get("fromUserAccount"),
+                    "to": native.get("toUserAccount"),
+                    "sol": sol,
+                })
+        try:
+            from edge.kol import side_wallets_from_transfers
+            found = side_wallets_from_transfers(wallet, transfers)
+        except Exception as exc:
+            logger.debug("side wallet trace: %s", exc)
+            return
+        cached = {
+            "ts": now,
+            "funder": found.get("funder"),
+            "side_wallets": list(found.get("side_wallets") or []),
+        }
+        _kol_side_cache[wallet] = cached
+    sides = list(cached.get("side_wallets") or [])[:3]
+    if not sides or _kol_side_budget["n"] >= 2:
+        return
+    side = sides[0]
+    _kol_side_budget["n"] += 1
+    buys = await get_kol_recent_buys(side, helius_key, None)
+    for buy in buys[:1]:
+        mint = buy.get("mint") or ""
+        recent = _kol_hot_contracts.get(mint) or []
+        if any(e.get("wallet") == side and now - e.get("ts", 0) < 3600 for e in recent):
+            continue
+        _record_kol_hot(label + " side", {
+            "mint": mint,
+            "sol_spent": buy.get("sol_spent") or 0,
+            "side": "buy",
+            "via": "swap",
+            "bag_pct": None,
+            "wallet": side,
+            "side_wallet": True,
+        })
+
+
 async def kol_tracker_job(ctx: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 5 minutes alongside sniper_job.
@@ -6615,6 +6946,7 @@ async def kol_tracker_job(ctx: ContextTypes.DEFAULT_TYPE):
     helius_key = os.environ.get("HELIUS_API_KEY", "")
     if not helius_key:
         return   # silently skip — no key, no tracker
+    _kol_side_budget["n"] = 0
 
     active_users = [
         (uid, ud) for uid, ud in users.items()
@@ -6636,28 +6968,53 @@ async def kol_tracker_job(ctx: ContextTypes.DEFAULT_TYPE):
                     continue   # Helius = Solana only
 
                 last_sig = user_sigs.get(wallet_addr)
-                new_buys = await get_kol_recent_buys(wallet_addr, helius_key, last_sig)
+                _edge_events = None
+                try:
+                    from edge.flags import kol_exits as _kol_on
+                    if _kol_on():
+                        _edge_events = await get_kol_wallet_events(wallet_addr, helius_key, last_sig)
+                except Exception as _ke:
+                    logger.debug("KOL event parse: %s", _ke)
+                    _edge_events = None
 
-                if not new_buys:
-                    continue
-
-                # Update last seen signature
-                user_sigs[wallet_addr] = new_buys[0]["signature"]
-
-                # ── Feature 3: Feed KOL buys into sniper score ────────
-                for _kb in new_buys[:3]:
-                    _km = _kb.get("mint", "")
-                    if _km:
-                        _kol_hot_contracts.setdefault(_km, []).append({
-                            "label":     wallet_label,
+                if _edge_events is not None:
+                    if _edge_events:
+                        user_sigs[wallet_addr] = _edge_events[0]["signature"]
+                        for _ev in _edge_events[:6]:
+                            _record_kol_hot(wallet_label, _ev)
+                        for _ev in _edge_events[:3]:
+                            if _ev.get("side") == "sell" or (
+                                _ev.get("side") == "in" and _ev.get("via") == "transfer"
+                            ):
+                                await _notify_kol_non_buy(ctx, uid, wallet_label, _ev)
+                    try:
+                        await _trace_kol_sides(wallet_addr, wallet_label, helius_key)
+                    except Exception as _side_err:
+                        logger.debug("KOL side trace: %s", _side_err)
+                    new_buys = [
+                        {
+                            "mint": e["mint"],
+                            "sol_spent": e.get("sol_spent", 0),
+                            "signature": e.get("signature"),
+                            "timestamp": e.get("timestamp"),
+                        }
+                        for e in _edge_events if e.get("side") == "buy"
+                    ]
+                    if not new_buys:
+                        continue
+                else:
+                    new_buys = await get_kol_recent_buys(wallet_addr, helius_key, last_sig)
+                    if not new_buys:
+                        continue
+                    user_sigs[wallet_addr] = new_buys[0]["signature"]
+                    for _kb in new_buys[:3]:
+                        _record_kol_hot(wallet_label, {
+                            "mint": _kb.get("mint", ""),
                             "sol_spent": _kb.get("sol_spent", 0),
-                            "ts":        _time.time(),
+                            "side": "buy",
+                            "via": "swap",
+                            "wallet": wallet_addr,
                         })
-                        # Keep max 10 entries per contract, expire after 2h
-                        _kol_hot_contracts[_km] = [
-                            e for e in _kol_hot_contracts[_km]
-                            if _time.time() - e["ts"] < 7200
-                        ][-10:]
 
                 # For each new buy, fetch token data and alert
                 for buy in new_buys[:3]:   # max 3 alerts per wallet per cycle
@@ -6985,6 +7342,13 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
     # global declaration must come before ANY assignment to these variables
     global _bot_username, _sol_bearish, _market_regime, _market_regime_cycles, _narrative_tracker, _narrative_history
     try:
+        try:
+            from edge.flags import market_mood as _mood_on
+            if _mood_on():
+                from edge.mood import refresh as _mood_refresh
+                await _mood_refresh()
+        except Exception as _mood_err:
+            logger.debug("market mood: %s", _mood_err)
         if not _bot_username:
             try:
                 me = await ctx.bot.get_me()
@@ -7261,8 +7625,23 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
                     if _time.time() - e["ts"] < 3600  # only last 1h
                 ]
                 info["kol_buy_count"]  = len(_kol_hits)
-                info["kol_sol_total"]  = round(sum(e["sol_spent"] for e in _kol_hits), 2)
+                info["kol_sol_total"]  = round(sum(e.get("sol_spent") or 0 for e in _kol_hits), 2)
                 info["kol_labels"]     = list({e["label"] for e in _kol_hits})
+                try:
+                    from edge.flags import kol_exits as _kol_exit_on
+                    if _kol_exit_on():
+                        from edge.kol import summarize_hot
+                        _kol_sum = summarize_hot(_kol_hits)
+                        info["kol_buy_count"] = _kol_sum["live_buy_count"]
+                        info["kol_boost_factor"] = _kol_sum["factor"]
+                        if _kol_sum.get("note"):
+                            info["kol_exit_note"] = _kol_sum["note"]
+                        info["kol_sol_total"] = round(sum(
+                            e.get("sol_spent") or 0 for e in _kol_hits
+                            if e.get("side", "buy") == "buy" and e.get("via", "swap") != "transfer"
+                        ), 2)
+                except Exception as _kol_sum_err:
+                    logger.debug("KOL hot summary: %s", _kol_sum_err)
 
                 sc = sniper_score(info)
                 try:
@@ -7273,6 +7652,10 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
 
             except Exception as e:
                 logger.warning(f"sniper_job token fetch failed {contract}: {e}")
+                continue
+
+            # Copies stay on the feed (record_scan already ran) but are not auto-bought.
+            if info.get("copycat_block_alert"):
                 continue
 
             # ── Dump log for channel-only users ──────────────────────────────
@@ -7657,7 +8040,15 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
                                 info["maker_pct"]    = helius_data.get("maker_pct")
                                 info["maker_count"]  = helius_data.get("maker_count")
                                 info["top3_vol_pct"] = helius_data.get("top3_vol_pct")
-                                # Re-score with maker data
+                                for _mk in ("quote_kind", "volume_usd", "multi_hop_txs", "quote_mint"):
+                                    if helius_data.get(_mk) is not None:
+                                        info[_mk] = helius_data[_mk]
+                                try:
+                                    from edge.enrich import enrich_onchain
+                                    await enrich_onchain(contract, info, helius_key)
+                                except Exception as _enr:
+                                    logger.debug("on-chain enrich skip: %s", _enr)
+                                # Re-score with maker data and any launch/cash-out/retention fields
                                 sc = sniper_score(info)
                         except Exception as _he:
                             logger.debug(f"Helius enrichment skip: {_he}")
@@ -8367,7 +8758,16 @@ def apex_capital_heat(ud: dict) -> float:
 
 def apex_position_size(ud: dict, ai_confidence: int, base_amount: float, info: dict | None = None, rug_risk: str = "LOW") -> float:
     heat = apex_capital_heat(ud)
-    if heat >= APEX_HEAT_STOP:
+    _mood_size = 1.0
+    _heat_stop = APEX_HEAT_STOP
+    try:
+        from edge.mood import heat_scale as _mood_heat, size_multiplier as _mood_size_fn
+        _mood_size = _mood_size_fn()
+        _heat_stop = min(0.95, APEX_HEAT_STOP * _mood_heat())
+    except Exception:
+        _mood_size = 1.0
+        _heat_stop = APEX_HEAT_STOP
+    if heat >= _heat_stop:
         return 0.0
     if ai_confidence >= 9:
         conf_mult = 1.0
@@ -8410,7 +8810,7 @@ def apex_position_size(ud: dict, ai_confidence: int, base_amount: float, info: d
             quality_mult = 0.6
         elif age_h > 1.0 or mc > 60_000:
             quality_mult = 0.8
-    return max(1.0, round(base_amount * conf_mult * heat_mult * dd_mult * size_mult * quality_mult, 2))
+    return max(1.0, round(base_amount * conf_mult * heat_mult * dd_mult * size_mult * quality_mult * _mood_size, 2))
 
 
 def apex_trail_pct(current_x: float, ud: dict | None = None) -> float:
@@ -8493,6 +8893,26 @@ def apex_check_threat(info: dict, h: dict) -> str:
     # 1. Liq drain — always RED regardless of position
     if liq_drop >= 25:
         return "RED"
+
+    # Launch-group and dev cash-out exits are paper signals. They only fire
+    # when the feature flag is on and the detector marked the data confident.
+    try:
+        from edge.flags import dev_cashout as _dev_on, dev_cashout_apex_exit as _dev_exit
+        from edge.flags import launch_group as _lg_on, launch_group_exit_pct as _lg_pct
+        from edge.launch_group import exit_triggered as _lg_exit
+        if _lg_on() and _lg_exit({
+            "confident": info.get("launch_group_confident"),
+            "sold_pct": info.get("launch_group_sold_pct"),
+        }, _lg_pct()):
+            info["_edge_threat_reason"] = (
+                f"launch group sold {float(info.get('launch_group_sold_pct') or 0):.0f}%"
+            )
+            return "RED"
+        if _dev_on() and _dev_exit() and info.get("dev_cashout"):
+            info["_edge_threat_reason"] = info.get("dev_cashout_reason") or "dev cash-out"
+            return "RED"
+    except Exception:
+        pass
 
     # 2. Buy pressure panic — context-aware
     if buy_pct_m5 < 10:
@@ -9041,12 +9461,24 @@ async def apex_run_position_manager(app, uid: int, ud: dict, positions_due: list
                         if _live.get("price"):
                             info["price"] = _live["price"]
                             info["liq"]   = _live.get("liq", info["liq"])
+                            for _pk in (
+                                "quote_kind", "fee_sweep", "price_indicative",
+                                "virtual_quote_reserves", "quote_mint",
+                            ):
+                                if _live.get(_pk) is not None:
+                                    info[_pk] = _live[_pk]
                             # ── Write Helius price back to shared cache so all
                             # callers in this cycle see the same price, not stale
                             # DexScreener data from up to 12s ago.
                             if contract in _token_cache:
                                 _token_cache[contract]["data"]["price"] = info["price"]
                                 _token_cache[contract]["data"]["liq"]   = info["liq"]
+                                for _pk in (
+                                    "quote_kind", "fee_sweep", "price_indicative",
+                                    "virtual_quote_reserves", "quote_mint",
+                                ):
+                                    if _pk in info:
+                                        _token_cache[contract]["data"][_pk] = info[_pk]
                     # Check for on-chain liquidity removal (instant rug signal)
                     _rug_sig = await get_helius_rug_signal(contract, _helius_key)
                     if _rug_sig.get("rug_detected"):
@@ -9089,6 +9521,12 @@ async def apex_run_position_manager(app, uid: int, ud: dict, positions_due: list
                     _hp = None
                 else:
                     _hp = APEX_PROFILES.get(_stored_profile)   # None = default, dict = hunter
+                try:
+                    from edge.enrich import enrich_onchain as _enrich_onchain
+                    if _helius_key:
+                        await _enrich_onchain(contract, info, _helius_key)
+                except Exception as _apex_enr:
+                    logger.debug("APEX on-chain enrich: %s", _apex_enr)
                 threat = apex_check_threat(info, h)
 
                 _prev_threat = h.get("apex_threat", "CLEAR")
@@ -10469,6 +10907,16 @@ def apex_watchlist_reversal(info: dict, rec: dict) -> tuple:
     if avg_5m_vol > 0 and vol_m5 < avg_5m_vol * WATCHLIST_VOL_MIN:
         return False, f"Volume dead ({round(vol_m5)} vs avg {round(avg_5m_vol)})"
 
+    try:
+        from edge.flags import holder_reentry_min_retention, holder_velocity
+        if holder_velocity():
+            from edge.holders import reentry_allowed
+            allowed, why = reentry_allowed(info, holder_reentry_min_retention())
+            if not allowed:
+                return False, why
+    except Exception:
+        pass
+
     return True, (
         f"MC ${int(cur_mc):,} | "
         f"Bounce +{round(bounce_pct*100,1)}% from bottom | "
@@ -11718,7 +12166,7 @@ def _build_meta_prompt_block(info: dict) -> str:
     return "\n".join(lines)
 
 
-async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, planned: bool = True, mood: str = "", vault_buy: bool = False) -> str | tuple:
+async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, planned: bool = True, mood: str = "", vault_buy: bool = False, exit_plan: dict | None = None) -> str | tuple:
     if not check_daily(ud):
         return "Daily limit of " + str(ud["daily_limit"]) + " trades reached."
     mp = ud.get("max_positions")
@@ -11810,6 +12258,14 @@ async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, plan
             "auto_sell_history":  [],
             "threat_history":     [],
         }
+    try:
+        from edge.exit_plan import attach as _attach_exit_plan
+        _held = ud["holdings"][contract]
+        _held["contract"] = contract
+        _attach_exit_plan(ud, _held, exit_plan, mood, vault_buy)
+    except Exception as _exit_plan_err:
+        logger.debug("exit plan attach: %s", _exit_plan_err)
+
     if planned:
         ud["planned"] += 1
     else:
@@ -19257,6 +19713,12 @@ def _register_persistence_state() -> None:
             "_persisted_rejected":      _apex_rejected,
         },
     )
+    try:
+        from persistence import register_kv_saver
+        from edge.runtime_state import flush as _edge_flush
+        register_kv_saver(_edge_flush)
+    except Exception as exc:
+        logger.debug("edge kv saver: %s", exc)
 
 
 def main():
@@ -19295,6 +19757,11 @@ def main():
 
     # Load all persisted user data before starting
     load_all(users, trade_log)
+    try:
+        from edge.runtime_state import restore as _edge_restore
+        _edge_restore()
+    except Exception as exc:
+        logger.warning("edge state restore: %s", exc)
 
     # Warm APEX in-memory learning from persisted data
     _migrated_users = 0

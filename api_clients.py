@@ -32,6 +32,7 @@ async def close_http() -> None:
 
 
 _sol_price_cache: dict = {"price": 0.0, "ts": 0.0}  # last-known SOL/USD (0.0 = never fetched), 60s TTL
+_quote_px_cache: dict = {}  # mint -> {"price": float, "ts": float}
 
 
 async def get_sol_price() -> float:
@@ -94,6 +95,48 @@ async def get_sol_price() -> float:
     return _sol_price_cache["price"]
 
 
+async def get_quote_usd(mint: str) -> float:
+    """USD price of a quote mint. Stables are 1. SOL uses get_sol_price.
+
+    Other mints use DexScreener, cached for 60s. Returns 0 when unknown.
+    Custom-pair pricing multiplies pool reserves by this price.
+    """
+    from edge.quotes import WSOL, classify_quote
+    if not mint:
+        return 0.0
+    kind = classify_quote(mint)
+    if kind == "stable":
+        return 1.0
+    if kind == "sol" or mint == WSOL:
+        return await get_sol_price()
+    now = _time.time()
+    hit = _quote_px_cache.get(mint)
+    if hit and now - hit["ts"] < 60:
+        return float(hit["price"])
+    price = 0.0
+    try:
+        client = await get_http()
+        response = await client.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+            timeout=5,
+        )
+        if response.status_code == 200:
+            pairs = response.json().get("pairs") or []
+            best = 0.0
+            for pair in pairs:
+                try:
+                    px = float(pair.get("priceUsd") or 0)
+                except (TypeError, ValueError):
+                    continue
+                liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+                if px > 0 and liq >= best:
+                    best = liq
+                    price = px
+    except Exception as exc:
+        logger.debug("quote USD lookup failed for %s: %s", mint[:8], exc)
+    _quote_px_cache[mint] = {"price": price, "ts": now}
+    return price
+
 
 async def get_helius_maker_pct(contract: str, api_key: str) -> dict:
     """
@@ -118,6 +161,18 @@ async def get_helius_maker_pct(contract: str, api_key: str) -> dict:
         txns = r.json()
         if not isinstance(txns, list) or not txns:
             return {}
+
+        from edge.flags import custom_pairs
+        if custom_pairs():
+            from edge.quotes import mints_needing_prices, summarize_swap_volume
+            sol_usd = _sol_price_cache.get("price") or 0.0
+            if sol_usd <= 0:
+                sol_usd = await get_sol_price()
+            prices = {}
+            for quote_mint in mints_needing_prices(txns, contract)[:4]:
+                prices[quote_mint] = await get_quote_usd(quote_mint)
+            summary = summarize_swap_volume(txns, contract, prices, sol_usd, use_quote_usd=True)
+            return summary or {}
 
         buyer_vols:  dict = {}   # wallet → volume bought
         seller_vols: dict = {}   # wallet → volume sold
@@ -172,6 +227,82 @@ async def get_helius_maker_pct(contract: str, api_key: str) -> dict:
         logger.debug(f"Helius maker enrichment failed: {e}")
         return {}
 
+async def _custom_pair_pool_price(client, rpc_url: str, contract: str, pair_addr: str, accounts: list) -> dict:
+    """Price a pool with the signed virtual quote reserve and the quote's USD price.
+
+    Falls back to {} so the caller keeps the SOL/USDC path or DexScreener.
+    """
+    import base64
+    from edge.quotes import (
+        WSOL, classify_quote, decode_pumpswap_pool, effective_quote_reserves,
+        observe_pool_fees, spot_price_usd,
+    )
+    decoded = None
+    try:
+        raw_resp = await client.post(rpc_url, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+            "params": [pair_addr, {"encoding": "base64", "commitment": "confirmed"}],
+        }, timeout=5)
+        if raw_resp.status_code == 200:
+            value = (raw_resp.json().get("result") or {}).get("value") or {}
+            blob = value.get("data")
+            if isinstance(blob, list) and blob:
+                decoded = decode_pumpswap_pool(base64.b64decode(blob[0]))
+            elif isinstance(blob, str):
+                decoded = decode_pumpswap_pool(base64.b64decode(blob))
+    except Exception as exc:
+        logger.debug("PumpSwap pool decode failed: %s", exc)
+        decoded = None
+
+    virtual = int(decoded["virtual_quote_reserves"]) if decoded else 0
+    quote_mint_hint = (decoded or {}).get("quote_mint")
+    base_raw = base_dec = None
+    quote_raw = quote_dec = None
+    quote_mint = quote_mint_hint
+    for acct in accounts:
+        info = acct.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+        mint = info.get("mint") or ""
+        token_amt = info.get("tokenAmount") or {}
+        try:
+            raw = int(token_amt.get("amount") or 0)
+            decimals = int(token_amt.get("decimals") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mint == contract:
+            base_raw, base_dec = raw, decimals
+        elif quote_mint_hint and mint == quote_mint_hint:
+            quote_raw, quote_dec, quote_mint = raw, decimals, mint
+        elif quote_raw is None and mint and mint != contract:
+            # No decoded pool: prefer WSOL, then a stable, then anything else.
+            if mint == WSOL or quote_mint is None or classify_quote(mint) == "stable":
+                quote_raw, quote_dec, quote_mint = raw, decimals, mint
+    if not base_raw or quote_raw is None or quote_dec is None or not quote_mint:
+        return {}
+    effective = effective_quote_reserves(quote_raw, virtual)
+    quote_usd = await get_quote_usd(quote_mint)
+    if quote_usd <= 0:
+        return {}
+    price = spot_price_usd(base_raw, effective, base_dec or 0, quote_dec, quote_usd)
+    if price <= 0:
+        return {}
+    quote_ui = effective / (10 ** int(quote_dec))
+    fees = {}
+    if decoded:
+        fees = observe_pool_fees(pair_addr, decoded.get("protocol_fees"), decoded.get("creator_fees"))
+    return {
+        "price": price,
+        "liq": quote_ui * quote_usd * 2,
+        "source": "helius_rpc_effective_reserves",
+        "quote_mint": quote_mint,
+        "quote_kind": classify_quote(quote_mint),
+        "virtual_quote_reserves": virtual,
+        "price_indicative": classify_quote(quote_mint) in {"custom", "unlisted"},
+        "fee_sweep": bool(fees.get("fee_sweep")),
+        "protocol_fees": fees.get("protocol_fees"),
+        "creator_fees": fees.get("creator_fees"),
+    }
+
+
 async def get_helius_pool_price(contract: str, pair_addr: str, api_key: str) -> dict:
     """
     Query Solana pool reserves directly via Helius RPC.
@@ -212,6 +343,12 @@ async def get_helius_pool_price(contract: str, pair_addr: str, api_key: str) -> 
         accounts = ta_resp.json().get("result", {}).get("value", [])
         if not accounts:
             return {}
+
+        from edge.flags import custom_pairs
+        if custom_pairs():
+            custom = await _custom_pair_pool_price(client, rpc_url, contract, pair_addr, accounts)
+            if custom:
+                return custom
 
         # Parse token balances — find base (token) and quote (SOL wrapped / USDC)
         WSOL  = "So11111111111111111111111111111111111111112"

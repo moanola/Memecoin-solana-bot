@@ -1,0 +1,8 @@
+{
+  "columns": ["pad", "day", "fees_usd", "volume_usd", "launches", "source"],
+  "rows": [
+    {"pad": "pump-fun", "day": "2026-10-16", "fees_usd": 100000, "volume_usd": 10000000, "launches": 8000, "source": "defillama"},
+    {"pad": "pump-fun", "day": "2026-10-17", "fees_usd": 110000, "volume_usd": 12000000, "launches": 9000, "source": "defillama"},
+    {"pad": "pump-fun", "day": "2026-10-18", "fees_usd": 180000, "volume_usd": 20000000, "launches": 11000, "source": "defillama"}
+  ]
+}

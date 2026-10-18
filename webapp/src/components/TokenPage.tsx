@@ -2,12 +2,17 @@ import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import { age, money, pct, price, signed } from "../format";
 import { haptic } from "../telegram";
-import type { Candle, TokenDetail } from "../types";
+import type { Candle, ExitPlan, TokenDetail } from "../types";
 import { PriceChart } from "./Chart";
 import { ScoreRing } from "./Score";
 
 const PRESETS = [25, 50, 100, 250];
 const SELLS = [25, 50, 75, 100];
+const EXIT_PRESETS: Record<string, ExitPlan> = {
+  scalp: { preset: "scalp", tp_x: 1.5, tp_pct: 1, invalidation_pct: 12, time_stop_min: 30 },
+  standard: { preset: "standard", tp_x: 2, tp_pct: 0.5, invalidation_pct: 18, time_stop_min: 120 },
+  runner: { preset: "runner", tp_x: 3, tp_pct: 0.33, invalidation_pct: 25, time_stop_min: 360 },
+};
 
 export function TokenPage({
   contract,
@@ -29,6 +34,19 @@ export function TokenPage({
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [exitPreset, setExitPreset] = useState("standard");
+  const [tpX, setTpX] = useState("2");
+  const [invalidation, setInvalidation] = useState("18");
+  const [timeStop, setTimeStop] = useState("120");
+
+  function applyPreset(name: string) {
+    const plan = EXIT_PRESETS[name];
+    setExitPreset(name);
+    setTpX(String(plan.tp_x));
+    setInvalidation(String(plan.invalidation_pct));
+    setTimeStop(String(plan.time_stop_min));
+    haptic("light");
+  }
 
   useEffect(() => {
     let gone = false;
@@ -60,7 +78,12 @@ export function TokenPage({
     setBusy("buy");
     setError(null);
     try {
-      const res = await api.buy(contract, usd);
+      const res = await api.buy(contract, usd, {
+        preset: exitPreset,
+        tp_x: Number(tpX) || undefined,
+        invalidation_pct: Number(invalidation) || undefined,
+        time_stop_min: Number(timeStop) || undefined,
+      });
       haptic("success");
       setNote(`Bought ${res.symbol} · fee ${money(res.fee)} · cash ${money(res.balance)}`);
       setCustom("");
@@ -123,6 +146,7 @@ export function TokenPage({
         <Stat label="Liq" value={money(token.liq)} />
         <Stat label="1h" value={pct(token.ch_h1)} tone={(token.ch_h1 || 0) >= 0 ? "up" : "down"} />
       </div>
+      <EdgeNotes token={token} />
       <PriceChart candles={candles} />
 
       {ai && (
@@ -204,6 +228,35 @@ export function TokenPage({
           onChange={(e) => setCustom(e.target.value)}
           className="w-full bg-panel2 border border-line rounded-xl px-3 py-2 num outline-none"
         />
+        <div className="text-[11px] tracking-[0.16em] uppercase text-mute">Exit plan before buy</div>
+        <div className="grid grid-cols-3 gap-2">
+          {Object.keys(EXIT_PRESETS).map((name) => (
+            <button
+              key={name}
+              onClick={() => applyPreset(name)}
+              className={`rounded-xl py-2 text-xs uppercase tracking-wider border ${exitPreset === name ? "border-cyan text-cyan" : "border-line text-mute"}`}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <label className="text-[10px] uppercase tracking-wider text-mute">
+            TP ×
+            <input value={tpX} inputMode="decimal" onChange={(e) => setTpX(e.target.value)} className="mt-1 w-full bg-panel2 border border-line rounded-xl px-2 py-2 num text-sm outline-none" />
+          </label>
+          <label className="text-[10px] uppercase tracking-wider text-mute">
+            Invalidation %
+            <input value={invalidation} inputMode="decimal" onChange={(e) => setInvalidation(e.target.value)} className="mt-1 w-full bg-panel2 border border-line rounded-xl px-2 py-2 num text-sm outline-none" />
+          </label>
+          <label className="text-[10px] uppercase tracking-wider text-mute">
+            Time stop min
+            <input value={timeStop} inputMode="decimal" onChange={(e) => setTimeStop(e.target.value)} className="mt-1 w-full bg-panel2 border border-line rounded-xl px-2 py-2 num text-sm outline-none" />
+          </label>
+        </div>
+        <div className="text-[11px] text-mute">
+          Paper only. The checker sells at the first of these. Selling earlier is logged as a rule break.
+        </div>
         {!balanceSet && <div className="text-xs text-amber">Set a starting balance with /start in Telegram before buying.</div>}
         <button
           disabled={busy !== null || !balanceSet}
@@ -230,6 +283,44 @@ export function TokenPage({
         {error && <div className="text-sm text-loss">{error}</div>}
       </div>
       <div className="text-[11px] text-mute break-all num">{token.contract}</div>
+    </div>
+  );
+}
+
+function EdgeNotes({ token }: { token: TokenDetail }) {
+  const rows: Array<{ tone: string; text: string }> = [];
+  if (token.pair_label || token.quote_symbol) {
+    rows.push({
+      tone: "text-cyan",
+      text: `Pair ${token.pair_label || token.quote_symbol}${token.price_indicative ? " · price indicative" : ""}${token.quote_kind ? ` · ${token.quote_kind}` : ""}`,
+    });
+  }
+  if (token.copycat_label) rows.push({ tone: token.copycat_role === "copy" ? "text-loss" : "text-cyan", text: token.copycat_label });
+  if (typeof token.launch_group_sold_pct === "number") {
+    rows.push({
+      tone: token.launch_group_sold_pct >= 25 ? "text-amber" : "text-mute",
+      text: `Launch group sold ${token.launch_group_sold_pct.toFixed(0)}%${token.launch_group_size ? ` · ${token.launch_group_size} wallets` : ""}`,
+    });
+  }
+  if (token.dev_cashout) rows.push({ tone: "text-loss", text: token.dev_cashout_reason || "Dev cash-out pattern" });
+  if (token.rug_memory_note) rows.push({ tone: "text-loss", text: token.rug_memory_note });
+  if (token.kol_exit_note) rows.push({ tone: "text-amber", text: token.kol_exit_note });
+  if (token.fee_sweep) rows.push({ tone: "text-amber", text: "Pool fees swept since last read" });
+  if (typeof token.holders_per_hour === "number") {
+    const held = typeof token.holder_retention_pct === "number" ? ` · ${token.holder_retention_pct.toFixed(0)}% of early buyers still in` : "";
+    rows.push({ tone: "text-mute", text: `${token.holders_per_hour.toFixed(1)} holders/hour${held}` });
+  }
+  if (token.position?.exit_plan) {
+    const p = token.position.exit_plan;
+    rows.push({ tone: "text-cyan", text: `Exit plan ${p.preset}: ${p.tp_x}× · −${p.invalidation_pct}% · ${p.time_stop_min}m` });
+  }
+  if (!rows.length) return null;
+  return (
+    <div className="card p-3 space-y-1">
+      <div className="text-[11px] tracking-[0.16em] uppercase text-mute">Edge</div>
+      {rows.map((row) => (
+        <div key={row.text} className={`text-sm ${row.tone}`}>{row.text}</div>
+      ))}
     </div>
   );
 }

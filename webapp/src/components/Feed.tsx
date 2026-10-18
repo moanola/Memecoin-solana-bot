@@ -53,6 +53,19 @@ export function Feed({
                 <span>Liq {money(t.liq)}</span>
                 <span className={up ? "text-gain" : "text-loss"}>{pct(t.ch_h1)} 1h</span>
               </div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {(t.pair_label || t.quote_symbol) && (
+                  <span className="chip">{t.pair_label || `quote ${t.quote_symbol}`}</span>
+                )}
+                {t.price_indicative && <span className="chip text-amber">indicative</span>}
+                {t.copycat_role === "copy" && <span className="chip text-loss">{t.copycat_label || "copy"}</span>}
+                {t.copycat_role === "original" && t.copycat_label && <span className="chip text-cyan">{t.copycat_label}</span>}
+                {typeof t.launch_group_sold_pct === "number" && t.launch_group_sold_pct >= 25 && (
+                  <span className="chip text-amber">launch sold {t.launch_group_sold_pct.toFixed(0)}%</span>
+                )}
+                {t.dev_cashout && <span className="chip text-loss">dev cash-out</span>}
+                {t.rug_memory_note && <span className="chip text-loss">rug wallet</span>}
+              </div>
             </div>
             <div className="flex flex-col items-center shrink-0">
               <ScoreRing score={t.score} />

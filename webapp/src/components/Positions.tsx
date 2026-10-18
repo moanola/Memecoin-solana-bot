@@ -41,6 +41,11 @@ export function Positions({
             <span>{money(p.value)}{p.price_live ? "" : " · delayed"}</span>
           </div>
           {p.mood && <div className="text-[10px] uppercase tracking-wider text-mute mt-1">{p.mood}</div>}
+          {p.exit_plan && (
+            <div className="text-[10px] text-cyan mt-1 num">
+              Exit {p.exit_plan.preset} · {p.exit_plan.tp_x}× · −{p.exit_plan.invalidation_pct}% · {p.exit_plan.time_stop_min}m
+            </div>
+          )}
         </button>
       ))}
       {tab === "closed" && trades.length === 0 && (
