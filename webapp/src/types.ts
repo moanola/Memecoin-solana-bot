@@ -73,6 +73,7 @@ export interface FeedToken {
   launch_group_size?: number | null;
   dev_cashout?: boolean;
   rug_memory_note?: string;
+  helius?: boolean;
   holders_per_hour?: number | null;
   holder_retention_pct?: number | null;
   kol_exit_note?: string;
@@ -106,8 +107,12 @@ export interface TokenDetail extends FeedToken {
     cost: number;
     value: number;
     pnl: number;
+    pnl_net?: number;
+    entry_fees?: number;
     avg_price: number;
+    mood?: string;
     exit_plan?: ExitPlan | null;
+    apex_exit?: { rules: string[]; stop_loss_pct?: number | null; trail_activate_x?: number } | null;
   } | null;
   dev_cashout_reason?: string;
   slippage: { sample_usd: number; slippage_pct: number; cost_usd: number } | null;
@@ -134,10 +139,13 @@ export interface Position {
   value: number;
   cost: number;
   pnl: number;
+  pnl_net?: number;
+  entry_fees?: number;
   pnl_pct: number;
   x: number;
   mood: string;
   exit_plan?: ExitPlan | null;
+  apex_exit?: { rules: string[] } | null;
   mc: number;
   liq: number;
 }
@@ -166,10 +174,11 @@ export interface ApexStatus {
   profit_sent: number;
   daily_pnl: number;
   heat_pct: number;
+  deployed?: number;
   positions: number;
   trades: number;
   wins: number;
-  win_rate: number;
+  win_rate: number | null;
   consec_losses: number;
   phase: string;
   balance: number | null;

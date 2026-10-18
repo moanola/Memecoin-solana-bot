@@ -183,7 +183,13 @@ export function App() {
             quickBuy={me?.quick_buy_amount || 100}
             balanceSet={Boolean(me?.balance_set)}
             onBack={() => setContract(null)}
-            onChanged={() => { void refreshBook(); }}
+            onChanged={(patch) => {
+              if (patch?.balance != null) {
+                setMe((current) => (current ? { ...current, balance: patch.balance ?? current.balance } : current));
+                setTick((current) => (current ? { ...current, balance: patch.balance ?? current.balance } : current));
+              }
+              void refreshBook();
+            }}
           />
         ) : tab === "feed" ? (
           <Feed tokens={tokens} loading={scanning} onOpen={setContract} onRefresh={() => { void loadFeed(true); }} />
@@ -195,14 +201,12 @@ export function App() {
           <Board />
         )}
       </main>
-      {!contract && (
-        <nav className="nav">
-          <Nav id="feed" tab={tab} setTab={setTab} label="Feed" />
-          <Nav id="positions" tab={tab} setTab={setTab} label="Book" />
-          <Nav id="apex" tab={tab} setTab={setTab} label="APEX" />
-          <Nav id="board" tab={tab} setTab={setTab} label="Board" />
-        </nav>
-      )}
+      <nav className="nav">
+        <Nav id="feed" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="Feed" />
+        <Nav id="positions" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="Book" />
+        <Nav id="apex" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="APEX" />
+        <Nav id="board" tab={tab} setTab={(id) => { setContract(null); setTab(id); }} label="Board" />
+      </nav>
     </div>
   );
 }

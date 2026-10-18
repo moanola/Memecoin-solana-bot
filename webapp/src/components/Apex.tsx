@@ -56,16 +56,13 @@ export function Apex({ onChanged }: { onChanged: () => void }) {
         </div>
         {status.mood && (
           <div className="mt-4 rounded-xl border border-line p-3">
-            <div className="text-[11px] uppercase tracking-wider text-mute">Market mood</div>
-            <div className="mt-1 flex items-baseline justify-between">
-              <span className="text-lg font-semibold">{status.mood.label}</span>
-              <span className="num text-cyan">{status.mood.score}</span>
-            </div>
-            <div className="mt-1 text-xs text-mute num">
+            <div className="text-[11px] uppercase tracking-wider text-mute text-center">Market mood</div>
+            <MoodGauge score={status.mood.score} label={status.mood.label} />
+            <div className="mt-1 text-xs text-mute num text-center">
               size ×{status.mood.size_mult} · heat ×{status.mood.heat_scale}
               {status.mood.share_7d_pct != null ? ` · pump.fun ${status.mood.share_7d_pct.toFixed(1)}%` : ""}
             </div>
-            <div className="mt-1 text-[10px] text-mute">{status.mood.attribution}</div>
+            <div className="mt-1 text-[10px] text-mute text-center">{status.mood.attribution}</div>
           </div>
         )}
         <div className="mt-4 text-[11px] uppercase tracking-wider text-mute">Capital heat {heat.toFixed(0)}%</div>
@@ -76,9 +73,15 @@ export function Apex({ onChanged }: { onChanged: () => void }) {
           <Cell k="Vault" v={money(status.vault)} />
           <Cell k="Today" v={signed(status.daily_pnl)} />
           <Cell k="Positions" v={String(status.positions)} />
-          <Cell k="Win rate" v={`${status.win_rate}%`} />
+          <Cell k="Win rate" v={status.win_rate == null ? "—" : `${status.win_rate}%`} />
           <Cell k="Phase" v={status.phase} />
-          <Cell k="Trades" v={String(status.trades)} />
+          <Cell k="Closed" v={String(status.trades)} />
+          {status.positions > 0 && status.trades === 0 && (
+            <div className="col-span-2 text-[11px] text-mute">
+              Open position is live. Win rate counts closed APEX trades. Heat is vault capital in the market
+              {status.deployed ? ` (${money(status.deployed)} deployed)` : ""}.
+            </div>
+          )}
         </div>
       </div>
       <div className="card p-4 space-y-2">
@@ -108,6 +111,37 @@ export function Apex({ onChanged }: { onChanged: () => void }) {
         <p className="text-xs text-mute">Same vault and split the Telegram APEX menu uses. APEX still trades only from the vault.</p>
       </div>
       {error && <div className="text-sm text-loss">{error}</div>}
+    </div>
+  );
+}
+
+function MoodGauge({ score, label }: { score: number; label: string }) {
+  const s = Math.max(0, Math.min(100, Number.isFinite(score) ? score : 0));
+  const r = 62;
+  const cx = 80;
+  const cy = 78;
+  const start = Math.PI;
+  const end = Math.PI + (s / 100) * Math.PI;
+  const x1 = cx + r * Math.cos(start);
+  const y1 = cy + r * Math.sin(start);
+  const x2 = cx + r * Math.cos(end);
+  const y2 = cy + r * Math.sin(end);
+  const large = s > 50 ? 1 : 0;
+  const color = label === "HOT" || label === "WARM" ? "var(--gain)" : label === "COLD" ? "var(--loss)" : "var(--cyan)";
+  return (
+    <div className="flex flex-col items-center">
+      <svg viewBox="0 0 160 100" className="w-full max-w-[240px]" role="img" aria-label={`${label} ${Math.round(s)}`}>
+        <path d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`} fill="none" stroke="rgba(160,176,198,0.2)" strokeWidth="10" strokeLinecap="round" />
+        {s > 0 && (
+          <path d={`M ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2}`} fill="none" stroke={color} strokeWidth="10" strokeLinecap="round" />
+        )}
+        <line x1={cx} y1={cy} x2={x2} y2={y2} stroke="var(--text)" strokeWidth="2" strokeLinecap="round" />
+        <circle cx={cx} cy={cy} r="3" fill="var(--text)" />
+        <text x="80" y="72" textAnchor="middle" fontSize="18" fill="var(--text)" fontFamily="IBM Plex Mono, ui-monospace, monospace">
+          {Math.round(s)}
+        </text>
+      </svg>
+      <div className="text-sm font-semibold -mt-1">{label}</div>
     </div>
   );
 }

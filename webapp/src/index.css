@@ -44,6 +44,11 @@ button, input { font: inherit; color: inherit; }
     var(--bg);
 }
 
+@media (min-width: 1024px) {
+  .app-shell { max-width: 1120px; }
+  .scroll { padding-left: 20px; padding-right: 20px; }
+}
+
 .scroll {
   flex: 1;
   overflow: auto;

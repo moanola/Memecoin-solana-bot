@@ -32,8 +32,10 @@ export function Feed({
           Scanner is quiet. Refresh to pull the latest DexScreener and pump.fun pass, or wait for the bot's 5-minute sniper cycle.
         </div>
       )}
+      <div className="space-y-3 lg:grid lg:grid-cols-2 lg:gap-3 lg:space-y-0">
       {tokens.map((t) => {
         const up = (t.ch_h1 || 0) >= 0;
+        const warns = feedWarnings(t);
         return (
           <button
             key={t.contract}
@@ -65,6 +67,9 @@ export function Feed({
                 )}
                 {t.dev_cashout && <span className="chip text-loss">dev cash-out</span>}
                 {t.rug_memory_note && <span className="chip text-loss">rug wallet</span>}
+                {warns.map((w) => (
+                  <span key={w.label} className={`chip ${w.tone}`}>{w.label}</span>
+                ))}
               </div>
             </div>
             <div className="flex flex-col items-center shrink-0">
@@ -74,6 +79,18 @@ export function Feed({
           </button>
         );
       })}
+      </div>
     </div>
   );
+}
+
+function feedWarnings(t: FeedToken): Array<{ label: string; tone: string }> {
+  const out: Array<{ label: string; tone: string }> = [];
+  if (!t.liq || t.liq <= 0) out.push({ label: "liq $0", tone: "text-loss" });
+  else if (t.mc > 0 && t.mc / t.liq > 50) out.push({ label: "thin liq", tone: "text-amber" });
+  const up = (t.ch_h1 != null && t.ch_h1 > 1000) || (t.ch_h24 != null && t.ch_h24 > 1000);
+  const down = (t.ch_h1 != null && t.ch_h1 < -80) || (t.ch_h24 != null && t.ch_h24 < -80);
+  if (up) out.push({ label: "extreme move", tone: "text-amber" });
+  if (down) out.push({ label: "extreme drop", tone: "text-loss" });
+  return out;
 }

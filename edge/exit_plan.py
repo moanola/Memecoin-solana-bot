@@ -94,7 +94,7 @@ def evaluate(plan: dict | None, holding: dict, price: float, now: datetime | Non
     if avg <= 0:
         return None
     multiple = price / avg
-    if multiple >= float(plan["tp_x"]):
+    if multiple >= float(plan["tp_x"]) and not plan.get("tp_done"):
         return "tp"
     drop = (price - avg) / avg * 100.0
     if drop <= -float(plan["invalidation_pct"]):
@@ -106,6 +106,21 @@ def evaluate(plan: dict | None, holding: dict, price: float, now: datetime | Non
         if held_min >= float(plan["time_stop_min"]):
             return "time_stop"
     return None
+
+
+def sell_fraction(plan: dict | None, why: str | None) -> float:
+    """Share of the position this exit leg sells. Take-profit uses tp_pct."""
+    if not why:
+        return 0.0
+    if why != "tp":
+        return 1.0
+    try:
+        pct = float((plan or {}).get("tp_pct") if (plan or {}).get("tp_pct") is not None else 1.0)
+    except (TypeError, ValueError):
+        pct = 1.0
+    if pct != pct:  # NaN
+        pct = 1.0
+    return min(1.0, max(0.05, pct))
 
 
 def note_early_sell(ud: dict, holding: dict, price: float, realized: float, reason: str) -> dict | None:

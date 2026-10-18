@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
-import { age, money, pct, price, signed } from "../format";
+import { age, money, pct, positionPnl, price, signed } from "../format";
 import { haptic } from "../telegram";
 import type { Candle, ExitPlan, TokenDetail } from "../types";
 import { PriceChart } from "./Chart";
@@ -25,14 +25,14 @@ export function TokenPage({
   quickBuy: number;
   balanceSet: boolean;
   onBack: () => void;
-  onChanged: () => void;
+  onChanged: (patch?: { balance?: number }) => void;
 }) {
   const [token, setToken] = useState<TokenDetail | null>(null);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [amount, setAmount] = useState(quickBuy || 100);
   const [custom, setCustom] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<{ text: string; up: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [exitPreset, setExitPreset] = useState("standard");
   const [tpX, setTpX] = useState("2");
@@ -69,7 +69,6 @@ export function TokenPage({
     const [detail, bars] = await Promise.all([api.token(contract), api.candles(contract)]);
     setToken(detail);
     setCandles(bars.candles);
-    onChanged();
   }
 
   async function buy() {
@@ -85,8 +84,8 @@ export function TokenPage({
         time_stop_min: Number(timeStop) || undefined,
       });
       haptic("success");
-      setNote(`Bought ${res.symbol} · fee ${money(res.fee)} · cash ${money(res.balance)}`);
-      setCustom("");
+      setNote({ text: `Bought ${res.symbol} · fee ${money(res.fee)} · cash ${money(res.balance)}`, up: true });
+      onChanged({ balance: res.balance });
       await reload();
     } catch (err) {
       haptic("error");
@@ -103,11 +102,14 @@ export function TokenPage({
     try {
       const res = await api.sell(contract, percent);
       haptic("success");
-      setNote(
-        res.closed
+      const up = (res.realized ?? 0) >= 0;
+      setNote({
+        text: res.closed
           ? `Closed ${res.symbol} · ${signed(res.realized)} · cash ${money(res.balance)}`
-          : `Sold ${percent}% · received ${money(res.received)}`,
-      );
+          : `Sold ${percent}% · ${signed(res.realized)} · cash ${money(res.balance)}`,
+        up,
+      });
+      onChanged({ balance: res.balance });
       await reload();
     } catch (err) {
       haptic("error");
@@ -122,8 +124,10 @@ export function TokenPage({
 
   const up = token.ch_h24 >= 0;
   const ai = token.ai;
+  const openPnl = token.position ? positionPnl(token.position.pnl, token.position.pnl_net) : 0;
   return (
-    <div className="space-y-3 pb-4">
+    <div className="space-y-3 pb-4 lg:grid lg:grid-cols-[minmax(0,1.15fr)_minmax(280px,0.85fr)] lg:gap-4 lg:items-start lg:space-y-0">
+      <div className="space-y-3 min-w-0">
       <button onClick={onBack} className="text-xs uppercase tracking-[0.16em] text-cyan">
         ← Back
       </button>
@@ -157,14 +161,17 @@ export function TokenPage({
           </div>
           <p className="text-sm leading-relaxed">{ai.thesis}</p>
           <div className="flex flex-wrap gap-2 text-[11px]">
-            {ai.rug_risk && <span className="chip">Rug {ai.rug_risk}</span>}
-            {ai.momentum && <span className="chip">{ai.momentum}</span>}
+            {ai.rug_risk && <span className="chip">Rug risk {ai.rug_risk.toLowerCase()}</span>}
+            {ai.momentum && <span className="chip">Momentum {ai.momentum.toLowerCase()}</span>}
           </div>
-          {ai.red_flags.length > 0 && (
+          {ai.red_flags.filter((f) => !isSoftRisk(f)).length > 0 && (
             <ul className="text-xs text-loss space-y-1">
-              {ai.red_flags.map((f) => <li key={f}>{f}</li>)}
+              {ai.red_flags.filter((f) => !isSoftRisk(f)).map((f) => <li key={f}>{f}</li>)}
             </ul>
           )}
+          {ai.red_flags.filter((f) => isSoftRisk(f)).map((f) => (
+            <div key={f} className="text-xs text-mute">{f}</div>
+          ))}
           {ai.green_flags.length > 0 && (
             <ul className="text-xs text-gain space-y-1">
               {ai.green_flags.map((f) => <li key={f}>{f}</li>)}
@@ -181,22 +188,24 @@ export function TokenPage({
           <span className="text-mute">LP burn</span>
           <span className="num text-right">{token.rug.lp_burn == null ? "—" : `${token.rug.lp_burn}%`}</span>
           <span className="text-mute">Top 10</span>
-          <span className="num text-right">{token.rug.top10_pct == null ? "—" : `${token.rug.top10_pct}%`}</span>
+          <span className="num text-right">{token.rug.top10_pct == null ? "—" : `${Number(token.rug.top10_pct).toFixed(1)}%`}</span>
         </div>
         {token.rug.rate_limited && <div className="text-xs text-amber mt-2">RugCheck rate-limited — security fields may be stale.</div>}
         {token.rug.risks.slice(0, 3).map((r) => (
-          <div key={r} className="text-xs text-loss mt-1">{r}</div>
+          <div key={r} className={`text-xs mt-1 ${isSoftRisk(r) ? "text-mute" : "text-loss"}`}>{r}</div>
         ))}
       </div>
+      </div>
 
+      <div className="space-y-3 min-w-0">
       {token.position && (
         <div className="card p-3 flex justify-between items-center">
           <div>
             <div className="text-[11px] uppercase tracking-wider text-mute">Open position</div>
             <div className="num">{money(token.position.value)}</div>
           </div>
-          <div className={token.position.pnl >= 0 ? "text-gain num" : "text-loss num"}>
-            {signed(token.position.pnl)}
+          <div className={openPnl >= 0 ? "text-gain num" : "text-loss num"}>
+            {signed(openPnl)}
           </div>
         </div>
       )}
@@ -279,12 +288,18 @@ export function TokenPage({
             ))}
           </div>
         )}
-        {note && <div className="text-sm text-gain">{note}</div>}
+        {note && <div className={`text-sm ${note.up ? "text-gain" : "text-loss"}`}>{note.text}</div>}
         {error && <div className="text-sm text-loss">{error}</div>}
       </div>
-      <div className="text-[11px] text-mute break-all num">{token.contract}</div>
+      <div className="text-[11px] text-mute break-all num max-w-full">{token.contract}</div>
+      </div>
     </div>
   );
+}
+
+function isSoftRisk(text: string): boolean {
+  const t = text.toLowerCase();
+  return t.includes("high mc") || t.includes("mid mc") || t.includes("less upside") || t.includes("already pumped");
 }
 
 function EdgeNotes({ token }: { token: TokenDetail }) {
@@ -312,15 +327,28 @@ function EdgeNotes({ token }: { token: TokenDetail }) {
   }
   if (token.position?.exit_plan) {
     const p = token.position.exit_plan;
-    rows.push({ tone: "text-cyan", text: `Exit plan ${p.preset}: ${p.tp_x}× · −${p.invalidation_pct}% · ${p.time_stop_min}m` });
+    const slice = p.tp_pct < 1 ? ` · sell ${Math.round(p.tp_pct * 100)}%` : "";
+    rows.push({ tone: "text-cyan", text: `Exit plan ${p.preset}: ${p.tp_x}×${slice} · −${p.invalidation_pct}% · ${p.time_stop_min}m` });
   }
-  if (!rows.length) return null;
+  const apexRules = token.position?.apex_exit?.rules || [];
+  const signals = rows.length > 0 || apexRules.length > 0;
   return (
     <div className="card p-3 space-y-1">
       <div className="text-[11px] tracking-[0.16em] uppercase text-mute">Edge</div>
       {rows.map((row) => (
         <div key={row.text} className={`text-sm ${row.tone}`}>{row.text}</div>
       ))}
+      {apexRules.map((rule) => (
+        <div key={rule} className="text-sm text-cyan">{rule}</div>
+      ))}
+      {!token.helius && (
+        <div className="text-sm text-mute">
+          On-chain edge needs a Helius key — launch group, dev cash-out, and holder retention stay blank until one is set.
+        </div>
+      )}
+      {!signals && token.helius && (
+        <div className="text-sm text-mute">No on-chain edge signals for this token yet.</div>
+      )}
     </div>
   );
 }

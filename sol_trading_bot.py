@@ -3211,6 +3211,11 @@ def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reaso
 
     realized = usd - cost
     ud["realized_pnl"] += realized
+    # Full buy cost and running realized stay on the holding. total_invested
+    # below is the remaining basis used to price the next partial; it is not
+    # what history should report once the position closes.
+    h.setdefault("buy_cost", h.get("total_invested", 0.0))
+    h["realized_total"] = round(float(h.get("realized_total") or 0.0) + realized, 4)
     # ── APEX vault trade: proceeds → vault, profit split → main balance ─────
     _apex_mood = h.get("mood", "") in ("APEX", "AI-Sniper", "APEX-DCA")
     _vault_funded = _apex_mood  # all APEX trades now route through vault
@@ -3273,17 +3278,20 @@ def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reaso
 
     closed = False
     if h["amount"] < 0.000001:
-        total_invested_full = h["total_invested"] + cost  # includes cost of this last sell
+        total_invested_full = float(h.get("buy_cost") or 0.0)
+        if total_invested_full <= 0:
+            total_invested_full = h["total_invested"] + cost
         total_returned_full = h.get("total_sold", 0.0)    # all proceeds including this sell
+        realized_full = round(float(h.get("realized_total") if h.get("realized_total") is not None else realized), 4)
         # Blended x = total money out / total money in
         x_val = round(total_returned_full / total_invested_full, 4) if total_invested_full > 0 else 0
         trade_log.setdefault(uid, []).append({
             "symbol":        h["symbol"],
             "contract":      contract,
             "chain":         h.get("chain", "unknown"),
-            "invested":      total_invested_full,
-            "returned":      total_returned_full,
-            "realized_pnl":  realized,
+            "invested":      round(total_invested_full, 4),
+            "returned":      round(total_returned_full, 4),
+            "realized_pnl":  realized_full,
             "x":             x_val,
             "hold_h":        round(hold_h, 1),
             "reason":        reason,
@@ -3326,6 +3334,34 @@ def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reaso
         "hold_h":     round(hold_h, 1),
         "auto_saved": auto_saved,
     }
+
+
+def apply_exit_plan_leg(ud: dict, uid: int, contract: str, price: float, liq: float | None = None) -> dict | None:
+    """Sell the slice the exit plan asks for. Take-profit uses tp_pct and stays open."""
+    from edge.exit_plan import evaluate as _eval_exit, sell_fraction
+    from edge.flags import exit_plan as _exit_on
+    if not _exit_on():
+        return None
+    h = (ud.get("holdings") or {}).get(contract)
+    if not h or not h.get("exit_plan") or price <= 0:
+        return None
+    why = _eval_exit(h.get("exit_plan"), h, price)
+    if not why:
+        return None
+    frac = sell_fraction(h.get("exit_plan"), why)
+    gross = float(h.get("amount") or 0) * float(price) * frac
+    if gross < 0.001:
+        return None
+    result = sell_core(ud, uid, contract, gross, price, "exit_" + why, liq=liq)
+    if why == "tp" and contract in (ud.get("holdings") or {}):
+        plan = dict(ud["holdings"][contract].get("exit_plan") or {})
+        plan["tp_done"] = True
+        ud["holdings"][contract]["exit_plan"] = plan
+        save_user(uid, ud)
+    out = dict(result)
+    out["why"] = why
+    out["fraction"] = frac
+    return out
 
 
 async def portfolio_val(ud: dict) -> tuple:
@@ -5151,23 +5187,24 @@ async def run_checker(app: Application):
                 continue
 
             if h.get("exit_plan"):
+                result = None
                 try:
-                    from edge.exit_plan import evaluate as _eval_exit
-                    from edge.flags import exit_plan as _exit_on
-                    _why = _eval_exit(h.get("exit_plan"), h, price) if _exit_on() else None
-                except Exception:
-                    _why = None
-                if _why and contract in ud["holdings"]:
-                    cv = h["amount"] * price
-                    result = sell_core(ud, uid, contract, cv, price, "exit_" + _why)
+                    result = apply_exit_plan_leg(ud, uid, contract, price, liq=info.get("liq"))
+                except Exception as _epe0:
+                    logger.debug("exit plan: %s", _epe0)
+                    result = None
+                if result:
+                    _why = result.get("why") or ""
                     _label = {"tp": "TAKE PROFIT", "invalidation": "INVALIDATION", "time_stop": "TIME STOP"}.get(_why, _why)
+                    _frac = result.get("fraction") or 1
+                    _slice = str(int(round(float(_frac) * 100))) + "%"
                     try:
                         await app.bot.send_message(
                             chat_id=uid, parse_mode="Markdown",
                             text=(
                                 "📋 *EXIT PLAN — " + _label + "*\n\n"
                                 "*$" + _md(h["symbol"]) + "*\n"
-                                "Sold: *" + money(result["received"]) + "*\n"
+                                "Sold: *" + _slice + "* → *" + money(result["received"]) + "*\n"
                                 "PnL: *" + pstr(result["realized"]) + "*\n"
                                 "Cash: *" + money(ud["balance"]) + "*"
                             ),
@@ -5976,6 +6013,51 @@ async def _dca_show_plan(q, contract: str, p: dict):
     )
 
 
+# pump.fun v3 accepts created_timestamp (not creation_time). Amounts are lamports
+# and raw token units (6 decimals). total_supply on a standard coin is 1e15.
+PUMPFUN_COINS_PARAMS = {"offset": 0, "limit": 50, "sort": "created_timestamp", "order": "DESC"}
+PUMPFUN_COIN_HOSTS = (
+    "https://frontend-api-v3.pump.fun/coins",
+    "https://frontend-api.pump.fun/coins",
+)
+_PF_SOL_LAMPORTS = 1_000_000_000
+_PF_TOKEN_SUPPLY = 1_000_000_000_000_000  # 1e9 tokens × 1e6 decimals
+
+
+def pumpfun_curve_pct(coin: dict) -> float:
+    """Bonding-curve progress. virtual_sol_reserves is lamports; 30→55 SOL is the band."""
+    graduated = bool(coin.get("raydium_pool")) or bool(coin.get("complete"))
+    if graduated:
+        return 100.0
+    try:
+        v_sol = float(coin.get("virtual_sol_reserves") or 0) / _PF_SOL_LAMPORTS
+    except (TypeError, ValueError):
+        return 0.0
+    initial, grad = 30.0, 55.0
+    if v_sol <= initial:
+        return 0.0
+    return round(min(max((v_sol - initial) / (grad - initial) * 100, 0), 100), 1)
+
+
+def pumpfun_dev_pct(coin: dict) -> float | None:
+    """Creator bag / supply. v3 omits creator_token_holdings — that is unknown, not 0%."""
+    if not isinstance(coin, dict) or coin.get("creator_token_holdings") is None:
+        return None
+    try:
+        held = float(coin.get("creator_token_holdings") or 0)
+        supply = float(coin.get("total_supply") or _PF_TOKEN_SUPPLY)
+    except (TypeError, ValueError):
+        return None
+    if supply <= 0:
+        return None
+    return round(held / supply * 100, 2)
+
+
+def _pumpfun_host_unusable(status: int) -> bool:
+    """400 is a bad query. 5xx (including the dead host's 530) is not a coin list."""
+    return status == 400 or status >= 500
+
+
 async def sniper_scan() -> list:
     """
     3-feed scan strategy:
@@ -5991,51 +6073,56 @@ async def sniper_scan() -> list:
     async def _fetch_pumpfun():
         try:
             client = await get_http()
-            # frontend-api.pump.fun is deprecated — try multiple endpoints
+            # frontend-api.pump.fun is deprecated and answers 530. Try v3 first.
             pf_resp = None
-            for pf_url in [
-                "https://frontend-api-v3.pump.fun/coins",
-                "https://frontend-api.pump.fun/coins",
-                # (unofficial herokuapp mirror removed — untrusted third party)
-            ]:
+            for pf_url in PUMPFUN_COIN_HOSTS:
                 try:
                     r = await client.get(
                         pf_url,
-                        params={"offset": 0, "limit": 50, "sort": "creation_time", "order": "DESC"},
+                        params=dict(PUMPFUN_COINS_PARAMS),
                         headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
                         timeout=6,
                     )
+                    if _pumpfun_host_unusable(r.status_code):
+                        logger.warning("Pump.fun %s returned %s — skipping host", pf_url, r.status_code)
+                        continue
                     if r.status_code == 200:
                         pf_resp = r
                         break
-                except Exception:
+                except Exception as _pf_err:
+                    logger.warning("Pump.fun %s failed: %s", pf_url, _pf_err)
                     continue
             if pf_resp and pf_resp.status_code == 200:
-                pf_data = pf_resp.json()
+                try:
+                    pf_data = pf_resp.json()
+                except Exception:
+                    logger.warning("Pump.fun coin list was not JSON")
+                    pf_data = None
+                if isinstance(pf_data, dict):
+                    pf_data = pf_data.get("coins") or pf_data.get("data") or []
                 if isinstance(pf_data, list):
-                    _pf_initial = 30.0
-                    _pf_grad    = 55.0
                     out = {}
                     for coin in pf_data:
+                        if not isinstance(coin, dict):
+                            continue
                         mint = coin.get("mint", "")
                         if not mint:
                             continue
-                        v_sol = float(coin.get("virtual_sol_reserves", 0) or 0)
-                        curve_pct = round(min(max((v_sol - _pf_initial) / (_pf_grad - _pf_initial) * 100, 0), 100), 1) if v_sol > _pf_initial else 0.0
                         graduated = bool(coin.get("raydium_pool")) or bool(coin.get("complete"))
-                        if graduated:
-                            curve_pct = 100.0
+                        try:
+                            v_lamports = float(coin.get("virtual_sol_reserves") or 0)
+                        except (TypeError, ValueError):
+                            v_lamports = 0.0
                         out[mint] = {
                             "tokenAddress": mint,
                             "chainId":      "solana",
                             "source":       "pumpfun",
                             "links":        [],
-                            "_pf_curve":    curve_pct,
+                            "_pf_curve":    pumpfun_curve_pct(coin),
                             "_pf_replies":  int(coin.get("reply_count", 0) or 0),
                             "_pf_graduated":graduated,
-                            # pump.fun returns raw token amount, not %. 
-                            # Total supply is always 1,000,000,000 tokens on pump.fun
-                            "_pf_dev_pct":  round(float(coin.get("creator_token_holdings", 0) or 0) / 1_000_000_000 * 100, 2),
+                            "_pf_dev_pct":  pumpfun_dev_pct(coin),
+                            "_pf_virtual_sol_lamports": v_lamports,
                             "_pf_name":     coin.get("name", ""),
                             "_pf_symbol":   coin.get("symbol", ""),
                             "_pf_twitter":  coin.get("twitter", ""),
@@ -6154,6 +6241,28 @@ def _build_history_context(ud: dict, uid: int) -> str:
     return "\n".join(lines)
 
 
+_VERDICT_RANK = {"SKIP": 0, "WAIT": 1, "SNIPE": 2}
+
+
+def verdict_allows_auto_buy(ai: dict | None, sc: dict | None) -> bool:
+    """APEX and auto-snipe buy only when the score verdict and the advisory both say SNIPE.
+
+    The rule-based fallback used to call score>=45 a SNIPE while sniper_score
+    requires >=72. That upgraded WAIT/SKIP names into buys. Never do that.
+    """
+    return (ai or {}).get("verdict") == "SNIPE" and (sc or {}).get("verdict") == "SNIPE"
+
+
+def _cap_verdict(verdict: str, score_verdict: str) -> str:
+    """Advisory may be more cautious than sniper_score, never more aggressive."""
+    ceiling = score_verdict if score_verdict in _VERDICT_RANK else "SKIP"
+    if verdict not in _VERDICT_RANK:
+        return ceiling
+    if _VERDICT_RANK[verdict] > _VERDICT_RANK[ceiling]:
+        return ceiling
+    return verdict
+
+
 async def ai_analyze_token(info: dict, sc: dict, ud: dict, uid: int = 0) -> dict:
     """
     Rule-based token analysis — derives verdict from sniper_score data.
@@ -6187,24 +6296,27 @@ async def ai_analyze_token(info: dict, sc: dict, ud: dict, uid: int = 0) -> dict
     buys_h1   = info.get("buys_h1", 0)
 
     # ── Verdict + Confidence ──────────────────────────────────────────────────
-    # Confidence maps score to 1-10 scale.
-    # Formula: (score + 15) // 10 so that score=45 → 6/10, score=55 → 7/10 etc.
-    # This aligns with APEX_MIN_CONFIDENCE=6 — any SNIPE-worthy token (score≥45)
-    # now meets the APEX entry gate. Old formula (score//10) mapped score=45→4,
-    # meaning APEX never triggered on tokens scoring 45-59 despite them passing
-    # all pre-filters and getting verdict=SNIPE.
+    # Thresholds match sniper_score (SNIPE >= 72, WAIT >= 54). The fallback
+    # must not upgrade sc["verdict"]: a 45 used to become SNIPE here and APEX
+    # bought it. Confidence still maps onto 1–10, but only after that cap.
+    score_verdict = str(sc.get("verdict") or "SKIP").upper()
     if flag_count >= 3 or score < 30:
         verdict    = "SKIP"
         confidence = max(1, min(3, 10 - score // 10))
-    elif score >= 45 and flag_count <= 1:
+    elif score >= 72 and flag_count <= 1:
         verdict    = "SNIPE"
-        confidence = min(10, max(4, (score + 15) // 10))
-    elif score >= 35:
+        confidence = min(10, max(6, (score + 15) // 10))
+    elif score >= 54:
         verdict    = "WAIT"
         confidence = min(6, max(3, score // 12))
     else:
         verdict    = "SKIP"
-        confidence = max(1, score // 15)
+        confidence = max(1, score // 15 or 1)
+    verdict = _cap_verdict(verdict, score_verdict)
+    if verdict == "SKIP":
+        confidence = min(confidence, 3)
+    elif verdict == "WAIT":
+        confidence = min(confidence, 6)
 
     # ── Rug Risk ──────────────────────────────────────────────────────────────
     if flag_count >= 2:
@@ -6267,7 +6379,13 @@ async def ai_analyze_token(info: dict, sc: dict, ud: dict, uid: int = 0) -> dict
 
     # ── Red / Green flags ─────────────────────────────────────────────────────
     red_flags   = [f.replace("🚨 ", "") for f in flags[:4]]
-    if warnings: red_flags += [warnings[0]]
+    # High MC is less upside, not a rug. Don't paint it as a red risk.
+    _soft_warn = ("high mc", "mid mc", "less upside", "already pumped")
+    for _w in warnings:
+        if any(s in str(_w).lower() for s in _soft_warn):
+            continue
+        red_flags.append(_w)
+        break
 
     green_flags = [s.replace("✅ ", "").replace("🔒 ", "").replace("🎯 ", "").replace("🚀 ", "").replace("⚡ ", "") for s in strengths[:4]]
 
@@ -8168,7 +8286,7 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
                     # APEX only enters on SNIPE verdict. WAIT was previously allowed
                     # in learning phase to gather data, but caused APEX to buy
                     # low-quality tokens indiscriminately ("buying every coin" bug).
-                    _apex_verdict_ok = ai["verdict"] == "SNIPE"
+                    _apex_verdict_ok = verdict_allows_auto_buy(ai, sc)
                     if ud.get("apex_mode") and _apex_verdict_ok:
                         apex_reset_daily(ud)
                         _ok = True
@@ -8230,7 +8348,7 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
                     # ════════════════════════════════════════════════════
                     # MODE 1 — FULL AUTO
                     # ════════════════════════════════════════════════════
-                    if ud.get("sniper_auto") and not ud.get("apex_mode") and ai["verdict"] == "SNIPE":
+                    if ud.get("sniper_auto") and not ud.get("apex_mode") and verdict_allows_auto_buy(ai, sc):
                         buy_amt = min(ai["suggested_amount"], ud["balance"], budget - spent)
                         if buy_amt < 1:
                             continue
@@ -8743,17 +8861,21 @@ def apex_get_phase(ud: dict) -> str:
 
 
 def apex_capital_heat(ud: dict) -> float:
-    # ── IMPORTANT: only count APEX/AI-Sniper holdings as "deployed" capital.
-    # Manual paper trades must NOT inflate heat or they will incorrectly block
-    # APEX entries and reduce position sizes even when APEX capital is free.
-    balance  = ud.get("balance", 0)
-    deployed = sum(
-        h.get("total_invested", 0)
-        for h in ud.get("holdings", {}).values()
-        if h.get("mood") in ("APEX", "AI-Sniper", "APEX-DCA")
-    )
-    total = balance + sum(h.get("total_invested", 0) for h in ud.get("holdings", {}).values())
-    return (deployed / total) if total > 0 else 0.0
+    # Heat is APEX capital only: vault cash plus open APEX positions.
+    # The main paper balance must not dilute it — a single vault position
+    # was showing 0% heat next to a large unused cash balance.
+    # Manual holdings are not in the numerator or the denominator.
+    def _f(v) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    deployed = 0.0
+    for h in ud.get("holdings", {}).values():
+        if h.get("mood") in ("APEX", "AI-Sniper", "APEX-DCA"):
+            deployed += _f(h.get("total_invested"))
+    base = _f(ud.get("apex_vault")) + deployed
+    return (deployed / base) if base > 0 else 0.0
 
 
 def apex_position_size(ud: dict, ai_confidence: int, base_amount: float, info: dict | None = None, rug_risk: str = "LOW") -> float:
@@ -12166,6 +12288,54 @@ def _build_meta_prompt_block(info: dict) -> str:
     return "\n".join(lines)
 
 
+async def bonding_curve_quote_usd(info: dict | None, contract: str) -> float | None:
+    """USD value of pump.fun virtual SOL reserves (quote side), or None.
+
+    The coins API returns lamports. Used only when DexScreener liquidity is
+    missing so a bonding-curve paper buy can still estimate slippage.
+    """
+    raw = None
+    if info:
+        raw = info.get("virtual_sol_reserves")
+        if raw is None:
+            raw = info.get("pf_virtual_sol_lamports")
+    if raw is None and contract:
+        raw = await _fetch_pumpfun_virtual_sol(contract)
+    try:
+        lamports = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if lamports <= 0:
+        return None
+    sol = lamports / _PF_SOL_LAMPORTS
+    try:
+        sol_usd = float(await get_sol_price() or 0)
+    except Exception:
+        return None
+    if sol_usd <= 0:
+        return None
+    return sol * sol_usd
+
+
+async def _fetch_pumpfun_virtual_sol(mint: str) -> float | None:
+    try:
+        client = await get_http()
+        r = await client.get(
+            "https://frontend-api-v3.pump.fun/coins/" + mint,
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            timeout=6,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+        val = float(data.get("virtual_sol_reserves") or 0)
+        return val or None
+    except Exception:
+        return None
+
+
 async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, planned: bool = True, mood: str = "", vault_buy: bool = False, exit_plan: dict | None = None) -> str | tuple:
     if not check_daily(ud):
         return "Daily limit of " + str(ud["daily_limit"]) + " trades reached."
@@ -12191,6 +12361,16 @@ async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, plan
     info = await get_token(contract, max_age=FILL_MAX_PRICE_AGE_S)
     if not info:
         return "Token not found on DexScreener."
+    from slippage import tradable_liquidity_usd
+    tradable = tradable_liquidity_usd(info.get("liq"), None)
+    if tradable is None:
+        quote_usd = await bonding_curve_quote_usd(info, contract)
+        tradable = tradable_liquidity_usd(0, quote_usd)
+        if tradable is not None:
+            info["liq"] = tradable
+            info["liq_from_curve"] = True
+    if tradable is None:
+        return "No pool liquidity. Paper buy refused until a pool or bonding-curve reserve is known."
     tokens = usd_amount / info["price"]
 
     # ── Simulated trading costs (gas + DEX fee + slippage) ───────────────────
@@ -12222,6 +12402,8 @@ async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, plan
         h["avg_price"]     = nt / na
         h["amount"]        = na
         h["total_invested"] = nt
+        h["buy_cost"] = round(float(h.get("buy_cost") or (nt - usd_amount)) + usd_amount, 4)
+        h["entry_fees"] = round(float(h.get("entry_fees") or 0.0) + _fee_cost, 4)
         # Keep avg_cost_mc as weighted average MC at buy time
         cur_mc  = info.get("mc", 0)
         old_mc  = h.get("avg_cost_mc", cur_mc)
@@ -12235,6 +12417,9 @@ async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, plan
             "amount":         tokens,
             "avg_price":      info["price"],
             "total_invested": usd_amount,
+            "buy_cost":       usd_amount,
+            "entry_fees":     _fee_cost,
+            "realized_total": 0.0,
             "total_sold":     0.0,
             "avg_cost_mc":    info.get("mc", 0),
             "auto_sells":     [],

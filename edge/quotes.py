@@ -231,8 +231,15 @@ def annotate_dex_pair(pair: dict, quote_usd: float | None = None) -> dict:
     qaddr = quote.get("address") or ""
     qsym = quote.get("symbol") or "?"
     bsym = base.get("symbol") or "?"
-    kind = classify_quote(qaddr)
-    indicative = kind in {"custom", "unlisted"}
+    chain = str(pair.get("chainId") or pair.get("chain") or "").strip().lower()
+    # Custom-pair labels are a Solana / pump.fun concept. An EVM pair whose
+    # quote address happens to decode like a listed mint must not be tagged.
+    if chain and chain not in {"solana", "sol"}:
+        kind = ""
+        indicative = False
+    else:
+        kind = classify_quote(qaddr)
+        indicative = kind in {"custom", "unlisted"}
     try:
         price_usd = float(pair.get("priceUsd") or 0)
     except (TypeError, ValueError):

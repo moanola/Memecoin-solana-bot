@@ -32,6 +32,31 @@ def slippage_pct(trade_usd: float, liq_usd: float | None, floor: float = SIM_SLI
     return min(MAX_SLIPPAGE_PCT, max(floor, price_impact_pct(trade_usd, liq_usd)))
 
 
+def tradable_liquidity_usd(liq_usd: float | None, curve_quote_usd: float | None = None) -> float | None:
+    """USD liquidity a paper buy is allowed to trade against.
+
+    DexScreener reports both sides of the pool. A pump.fun bonding-curve coin
+    often has no pool yet: pass the virtual SOL reserve in USD (quote side
+    only). This doubles it so ``price_impact_pct``'s reserve (liq/2) matches
+    that quote side. Zero or unknown liquidity with no curve estimate returns
+    None and the buy must be refused. ``slippage_pct`` itself still uses the
+    floor when a caller asks for a percent against missing liquidity.
+    """
+    try:
+        liq = float(liq_usd or 0)
+    except (TypeError, ValueError):
+        liq = 0.0
+    if liq > 0:
+        return liq
+    try:
+        quote = float(curve_quote_usd or 0)
+    except (TypeError, ValueError):
+        quote = 0.0
+    if quote > 0:
+        return quote * 2.0
+    return None
+
+
 def trade_cost_usd(trade_usd: float, liq_usd: float | None) -> float:
     """Total simulated cost of one trade: DEX fee + slippage + flat gas."""
     trade_usd = max(0.0, float(trade_usd or 0))

@@ -200,11 +200,12 @@ def remember(mood: dict) -> dict:
 
 
 def cached(max_age_s: float = 900) -> dict | None:
+    """Return the gauge only while it is inside ``max_age_s``. Stale is None so callers refresh."""
     mood = _cache.get("mood")
     if not mood:
         return None
     if time.time() - float(_cache.get("ts") or 0) > max_age_s:
-        return mood  # stale is still better than nothing; callers may refresh
+        return None
     return mood
 
 
