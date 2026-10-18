@@ -69,3 +69,15 @@ SIM_TOTAL_PCT       = SIM_DEX_FEE_PCT + SIM_SLIPPAGE_PCT  # 0.75% per trade (min
 
 # Refresh the token price at fill time if the cached quote is older than this.
 FILL_MAX_PRICE_AGE_S = float(os.getenv("FILL_MAX_PRICE_AGE_S", "5"))
+
+# ── Paper-trading terminal (FastAPI, same process as the bot) ────────────────
+# WEBAPP_URL is the HTTPS origin of the static PWA (Vercel / Cloudflare Pages).
+# When set, /terminal and the chat menu button open it as a Telegram Mini App.
+# WEBAPP_ORIGIN is the browser Origin allowed to call the API (CORS). Usually
+# the same value as WEBAPP_URL, without a trailing path. Comma-separated list OK.
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
+WEBAPP_ORIGIN = os.getenv("WEBAPP_ORIGIN", "").strip()
+# Railway injects PORT. Local runs default to 8080.
+API_PORT = int(os.getenv("PORT", "8080"))
+# Reject Mini App initData / Login Widget payloads older than this.
+INITDATA_MAX_AGE_S = int(os.getenv("INITDATA_MAX_AGE_S", "86400"))

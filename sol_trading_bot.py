@@ -9,7 +9,10 @@ import re as _re
 import logging
 import os
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    WebAppInfo, MenuButtonWebApp,
+)
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     CallbackQueryHandler, MessageHandler, filters
@@ -3744,8 +3747,18 @@ def group_token_card(info: dict, contract: str) -> str:
         card = card[:4092] + "…"
     return card
 
+def _terminal_url() -> str:
+    """HTTPS Mini App URL, or empty when the terminal is not configured."""
+    url = os.getenv("WEBAPP_URL", "").strip()
+    return url if url.startswith("https://") else ""
+
+
 def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = []
+    url = _terminal_url()
+    if url:
+        rows.append([InlineKeyboardButton("📱 Terminal", web_app=WebAppInfo(url=url))])
+    rows.extend([
         [InlineKeyboardButton("📈 Positions",      callback_data="v_pos"),
          InlineKeyboardButton("⏰ Orders",         callback_data="v_orders")],
         [InlineKeyboardButton("👛 Wallet",         callback_data="v_wallet"),
@@ -3756,6 +3769,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎯 Sniper",         callback_data="v_sniper")],
         [InlineKeyboardButton("⚡ BUY & SELL NOW!", callback_data="v_trade")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def more_menu_kb() -> InlineKeyboardMarkup:
@@ -7251,6 +7265,11 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
                 info["kol_labels"]     = list({e["label"] for e in _kol_hits})
 
                 sc = sniper_score(info)
+                try:
+                    from webapi import record_scan
+                    record_scan(contract, info, sc, source="sniper")
+                except Exception:
+                    pass
 
             except Exception as e:
                 logger.warning(f"sniper_job token fetch failed {contract}: {e}")
@@ -19193,11 +19212,32 @@ async def dump_log_drain_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             logger.debug(f"Dump log drain: {sent} sent for uid={uid}, {len(queue)} remaining")
 
 
+async def cmd_terminal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Open the paper-trading Mini App. No-op message when WEBAPP_URL is unset."""
+    msg = update.effective_message
+    if msg is None:
+        return
+    url = _terminal_url()
+    if not url:
+        await msg.reply_text(
+            "Terminal is not configured. Set WEBAPP_URL to the HTTPS address of the web app."
+        )
+        return
+    await msg.reply_text(
+        "📱 *APEX Terminal*\n\nPaper trading only — same balance as this chat.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Open Terminal", web_app=WebAppInfo(url=url)),
+        ]]),
+    )
+
+
 def _register_handlers(app) -> None:
     """Every handler goes through access_gate except /start, which is the
     access-request entry point and applies the same user_has_access() check."""
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  access_gate(cmd_start)))
+    app.add_handler(CommandHandler("terminal", access_gate(cmd_terminal)))
     app.add_handler(CommandHandler("admin", access_gate(cmd_admin)))
     app.add_handler(CommandHandler("lb",    access_gate(cmd_leaderboard)))
     app.add_handler(CommandHandler("stats", access_gate(cmd_user_stats)))
@@ -19322,10 +19362,29 @@ def main():
         global _rugcheck_semaphore
         _rugcheck_semaphore = _asyncio.Semaphore(2)
         logger.info("RugCheck semaphore initialized (max 2 concurrent).")
+        url = _terminal_url()
+        if url:
+            try:
+                await application.bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(text="Terminal", web_app=WebAppInfo(url=url))
+                )
+                logger.info("Chat menu button opens the trading terminal")
+            except Exception as exc:
+                logger.warning("Could not set Terminal menu button: %s", exc)
+        try:
+            from webapi import start_server
+            await start_server()
+        except Exception as exc:
+            logger.error("Terminal API failed to start: %s", exc)
     app.post_init = _on_startup
 
     # Graceful HTTP client shutdown
     async def _on_shutdown(application):
+        try:
+            from webapi import stop_server
+            await stop_server()
+        except Exception:
+            pass
         await close_http()
     app.post_shutdown = _on_shutdown
 
