@@ -1227,6 +1227,17 @@ def _apply_glass_panel(img: "Image.Image", box: tuple, radius: int = 22,
 
 
 
+def generate_trade_card(symbol: str, chain: str, pnl_str: str, x_val: str, held_h: str,
+                        bought_str: str, position_str: str, username: str, pnl_pct: str,
+                        pnl_positive: bool, closed_at=None,
+                        bought_label: str = "Bought", position_label: str = "Position"):
+    """Win/loss trade PnL card (PNG BytesIO) or None.
+
+    NOTE: this def line was missing in the original upload, so the body ran
+    as dead code at the end of _apply_glass_panel() and every call to
+    generate_trade_card() raised NameError (trade cards never rendered).
+    x_val is accepted for call-site compatibility; the card shows pnl_pct.
+    """
     if not PILLOW_OK:
         return None
     try:
