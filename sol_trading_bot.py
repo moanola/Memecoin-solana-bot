@@ -230,7 +230,7 @@ async def get_http() -> httpx.AsyncClient:
 _token_cache: dict = {}
 CACHE_TTL = 30.0   # seconds — raised to 30s to reduce DexScreener 429s during sniper scans
 _ch_card_cache: dict = {}   # {contract[:32]: {channel_id, msg_id, info, sc, ai, expanded}}
-_sol_price_cache: dict = {"price": 150.0, "ts": 0.0}  # cached SOL/USD, refreshed hourly
+_sol_price_cache: dict = {"price": 0.0, "ts": 0.0}  # last-known SOL/USD (0.0 = never fetched), 60s TTL
 
 # ── RugCheck cache (5 min TTL) ────────────────────────────────────────────────
 # RugCheck security data (mint, freeze, LP burn, holders, risk flags) doesn't
@@ -267,7 +267,9 @@ async def get_sol_price() -> float:
     Source priority:
       1. DexScreener  — SOL/USDC pair (most accurate for trading)
       2. CoinGecko    — free public API, no key required
-      3. Last cached  — stale but better than a hardcoded guess
+      3. Last known   — stale but better than a hardcoded guess
+    Returns 0.0 only if no source has ever succeeded since startup; callers
+    must treat <= 0 as "unknown".
     """
     now = _time.time()
     if now - _sol_price_cache["ts"] < 60:
@@ -313,7 +315,10 @@ async def get_sol_price() -> float:
         logger.warning("SOL price CoinGecko failed: %s", e)
 
     # ── Source 3: Last known cache (stale but non-zero) ───────────────────────
-    logger.warning("SOL price: all sources failed — using last cached $%.2f", _sol_price_cache["price"])
+    if _sol_price_cache["price"] > 0:
+        logger.warning("SOL price: all sources failed — using last known $%.2f", _sol_price_cache["price"])
+    else:
+        logger.warning("SOL price: all sources failed and no last-known price yet")
     return _sol_price_cache["price"]
 
 
@@ -453,7 +458,9 @@ async def get_helius_pool_price(contract: str, pair_addr: str, api_key: str) -> 
                 base_amt = balance
             elif mint == WSOL:
                 # Use live SOL/USD price from cache (refreshed every 60s)
-                sol_price = _sol_price_cache.get("price", 150.0)
+                sol_price = _sol_price_cache.get("price", 0.0)
+                if sol_price <= 0:
+                    continue   # SOL/USD unknown — caller falls back to DexScreener
                 quote_usd = balance * sol_price
             elif mint in (USDC, USDT):
                 quote_usd = balance
@@ -5713,7 +5720,7 @@ async def daily_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
     for uid, ud in list(users.items()):
         if ud.get("balance") is None:
             continue
-        today = datetime.now().date()
+        today = datetime.now(BOT_TZ).date()   # day boundary in BOT_TIMEZONE
         logs = trade_log.get(uid, [])
 
         def _to_date(val):
@@ -5779,9 +5786,9 @@ async def daily_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
-    now = datetime.utcnow()
-    if now.day != 1:
+    if datetime.now(BOT_TZ).day != 1:   # first of the month in BOT_TIMEZONE
         return
+    now = datetime.utcnow()
     month_ago = now - timedelta(days=30)
     for uid, ud in list(users.items()):
         if ud.get("balance") is None:
@@ -5962,8 +5969,8 @@ async def weekly_filter_analysis_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     DMs the user a clean report with specific recommendations.
     """
     now = datetime.utcnow()
-    # Only run on Sunday (UTC — Railway runs in UTC)
-    if now.weekday() != 6:
+    # Only run on Sunday in BOT_TIMEZONE (default UTC)
+    if datetime.now(BOT_TZ).weekday() != 6:
         return
 
     for uid, ud in list(users.items()):
@@ -6193,7 +6200,7 @@ async def sniper_scan() -> list:
             for pf_url in [
                 "https://frontend-api-v3.pump.fun/coins",
                 "https://frontend-api.pump.fun/coins",
-                "https://client-api-2-74b1891ee9f9.herokuapp.com/coins",
+                # (unofficial herokuapp mirror removed — untrusted third party)
             ]:
                 try:
                     r = await client.get(
@@ -7058,7 +7065,7 @@ async def kol_tracker_job(ctx: ContextTypes.DEFAULT_TYPE):
                         sc  = sniper_score(info)
                         sol = buy["sol_spent"]
                         sol_usd = await get_sol_price()
-                        usd_est = sol * sol_usd
+                        usd_est = sol * sol_usd   # 0 if SOL/USD unknown
 
                         # Build alert message
                         score_tag  = "🔴 WEAK" if sc["score"] < 40 else "🟡 MODERATE" if sc["score"] < 65 else "🟢 STRONG"
@@ -7087,7 +7094,7 @@ async def kol_tracker_job(ctx: ContextTypes.DEFAULT_TYPE):
                                 "`" + wallet_addr[:20] + "...`\n\n"
                                 "🪙 *$" + _md(info["symbol"]) + "*  ·  " + info.get("chain","?").upper() + "\n"
                                 "`" + mint + "`\n\n"
-                                "💰 Bought: *" + str(sol) + " SOL* (~$" + f"{usd_est:,.0f}" + ")\n"
+                                "💰 Bought: *" + str(sol) + " SOL*" + ((" (~$" + f"{usd_est:,.0f}" + ")") if usd_est > 0 else "") + "\n"
                                 "📊 MC: *" + mc_str(info["mc"]) + "*  ·  Age: *" + str(round(info.get("age_h",0),1)) + "h*\n"
                                 "💧 Liq: *" + money(info["liq"]) + "*\n"
                                 + pf_line
@@ -7385,7 +7392,8 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
         # ── Feature 2: SOL market condition check ─────────────────────
         try:
             _sol_now = await get_sol_price()
-            _sol_price_history.append((_time.time(), _sol_now))
+            if _sol_now > 0:   # skip unknown price (no source has succeeded yet)
+                _sol_price_history.append((_time.time(), _sol_now))
             # Keep only last 12 entries (~1 hour of 5-min runs)
             if len(_sol_price_history) > 12:
                 _sol_price_history.pop(0)
@@ -7393,7 +7401,7 @@ async def sniper_job(ctx: ContextTypes.DEFAULT_TYPE):
             _sol_bearish = False
             if len(_sol_price_history) >= 6:
                 _sol_30m_ago = _sol_price_history[-6][1]
-                if _sol_30m_ago > 0 and _sol_now < _sol_30m_ago * 0.96:
+                if _sol_30m_ago > 0 and 0 < _sol_now < _sol_30m_ago * 0.96:
                     _sol_bearish = True
                     logger.info(f"SOL market bearish — {_sol_30m_ago:.2f} → {_sol_now:.2f} (-{round((1-_sol_now/_sol_30m_ago)*100,1)}%). APEX entries paused.")
         except Exception:
@@ -11923,94 +11931,12 @@ async def enrich_twitter_momentum(info: dict, http_client) -> dict:
     except Exception:
         pass   # oEmbed unavailable — don't fail the whole enrichment
 
-    # ── Try nitter for richer data ─────────────────────────────────────────
-    nitter_instances = [
-        "https://nitter.privacydev.net",
-        "https://nitter.poast.org",
-        "https://nitter.1d4.us",
-        "https://nitter.kavin.rocks",
-    ]
-    profile_html = None
-    for nitter in nitter_instances:
-        try:
-            r = await http_client.get(f"{nitter}/{handle}", timeout=7,
-                                      headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200 and "tweet" in r.text.lower():
-                profile_html = r.text
-                break
-        except Exception:
-            continue
-
-    if profile_html:
-        import re as _re
-        result["tw_verified"] = True
-
-        # Extract follower count
-        fol_match = _re.search(r'([\d,]+)\s*Followers', profile_html, _re.IGNORECASE)
-        if fol_match:
-            try:
-                followers = int(fol_match.group(1).replace(",",""))
-                result["tw_followers"] = followers
-                if followers < 50:
-                    flags.append(f"Very low followers: {followers}")
-                    score -= 2
-                elif followers < 300:
-                    flags.append(f"Low followers: {followers}")
-                    score -= 1
-                elif followers > 5000:
-                    score += 2   # real following
-                elif followers > 1000:
-                    score += 1
-            except ValueError:
-                pass
-
-        # Account join date
-        join_match = _re.search(r'Joined\s+(\w+\s+\d{4})', profile_html, _re.IGNORECASE)
-        if join_match:
-            try:
-                from datetime import datetime as _dt
-                joined = _dt.strptime(join_match.group(1), "%B %Y")
-                age_d  = (_dt.now() - joined).days
-                result["tw_account_age_d"] = age_d
-                if age_d < 7:
-                    result["tw_is_fresh_acct"] = True
-                    flags.append(f"Account created {age_d}d ago — very fresh")
-                    score -= 3
-                elif age_d < 30:
-                    flags.append(f"Account created {age_d}d ago")
-                    score -= 1
-                elif age_d > 365:
-                    score += 2   # established account
-            except Exception:
-                pass
-
-        # Count recent tweets (rough — count tweet containers in HTML)
-        tweet_count = len(_re.findall(r'class="tweet-content"', profile_html))
-        result["tw_recent_tweets"] = tweet_count
-        if tweet_count == 0:
-            flags.append("No recent tweets visible")
-            score -= 2
-        elif tweet_count >= 5:
-            score += 1   # active posting
-
-        # Bot pattern detection — if all tweet texts start identically
-        tweet_texts = _re.findall(r'class="tweet-content[^"]*"[^>]*>(.*?)</div>', profile_html, _re.DOTALL)
-        if len(tweet_texts) >= 3:
-            # Strip HTML tags for comparison
-            clean = [_re.sub(r'<[^>]+>', '', t).strip()[:30] for t in tweet_texts]
-            # If 80%+ start with same 20 chars = bot pattern
-            prefixes = [c[:20] for c in clean if len(c) >= 20]
-            if prefixes and len(set(prefixes)) == 1 and len(prefixes) >= 3:
-                flags.append("Bot pattern: all tweets identical structure")
-                score -= 3
-
-    else:
-        # Nitter failed — can't get details, slight uncertainty penalty
-        if result["tw_verified"]:
-            pass   # account exists but can't get details
-        else:
-            flags.append("Twitter account unverifiable")
-            score -= 1
+    # Nitter scraping was removed: all public Nitter instances are dead, so
+    # this path always fell through to the "unverifiable" branch below.
+    # Profile details (followers, join date, tweets) are no longer scraped.
+    if not result["tw_verified"]:
+        flags.append("Twitter account unverifiable")
+        score -= 1
 
     result["tw_flags"]           = flags
     result["tw_momentum_score"]  = max(0, min(10, score))
@@ -12020,7 +11946,7 @@ async def enrich_twitter_momentum(info: dict, http_client) -> dict:
 async def enrich_holder_distribution(contract: str, chain: str, http_client) -> dict:
     """
     Fetches top holder distribution.
-    Solana: uses Solscan public API
+    Solana: returns the empty result (see RugCheck/Helius for holder data)
     EVM:    uses DexScreener token page data
 
     Returns dict:
@@ -12046,72 +11972,11 @@ async def enrich_holder_distribution(contract: str, chain: str, http_client) -> 
     flags = []
     score = 6
 
-    # ── Solana: Solscan public API ────────────────────────────────────────────
+    # ── Solana: no holder source here ─────────────────────────────────────────
+    # The Solscan public API this used is dead (404 for every token), so the
+    # code was removed. Holder data for Solana comes from RugCheck / Helius.
     if chain_lower in ("solana", "sol"):
-        try:
-            # Solscan public API is deprecated and returns 404 for all tokens.
-            # Returning empty result dict — holder data comes from Helius maker_pct instead.
-            return result  # solscan_dead
-            url = f"https://public-api.solscan.io/token/holders?tokenAddress={contract}&limit=20&offset=0"  # noqa: dead
-            r = await http_client.get(url, timeout=8,
-                                      headers={"accept": "application/json",
-                                               "User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                holders_raw = data.get("data", [])
-                total_supply = data.get("total", 1) or 1
-
-                if holders_raw:
-                    top_pcts = []
-                    dist     = []
-                    for i, h in enumerate(holders_raw[:10]):
-                        amt = h.get("amount", 0)
-                        pct = round(amt / total_supply * 100, 2) if total_supply > 0 else 0
-                        top_pcts.append(pct)
-                        addr = h.get("address", "")
-                        dist.append({
-                            "rank":  i + 1,
-                            "pct":   pct,
-                            "addr":  addr[:6] + "…" + addr[-4:] if len(addr) > 10 else addr,
-                        })
-
-                    result["holder_distribution"] = dist
-                    result["holder_top10_pct"]    = round(sum(top_pcts), 2)
-                    result["holder_top1_pct"]     = top_pcts[0] if top_pcts else None
-                    result["holder_count"]        = data.get("total", None)
-
-                    top10 = result["holder_top10_pct"]
-                    top1  = result["holder_top1_pct"] or 0
-
-                    # Score top10 concentration
-                    if top10 > 60:
-                        flags.append(f"Top 10 wallets hold {top10}% — extreme concentration")
-                        score -= 4
-                    elif top10 > 40:
-                        flags.append(f"Top 10 wallets hold {top10}% — high concentration")
-                        score -= 2
-                    elif top10 < 20:
-                        score += 2   # well distributed
-
-                    # Score top1
-                    if top1 > 20:
-                        flags.append(f"Single wallet holds {top1}% — whale risk")
-                        score -= 3
-                    elif top1 > 10:
-                        flags.append(f"Largest wallet: {top1}%")
-                        score -= 1
-
-                    # Check if top wallets all created around same time (coordinated)
-                    # We can detect this if top 5 all have similar addresses (heuristic)
-                    if len(dist) >= 3:
-                        # If top 3 wallets each hold >8%, likely coordinated
-                        top3_each = [d["pct"] for d in dist[:3]]
-                        if all(p > 8 for p in top3_each):
-                            flags.append("Top 3 wallets each >8% — possible coordinated hold")
-                            score -= 2
-
-        except Exception as _se:
-            logger.debug(f"Solscan holder fetch failed: {_se}")
+        return result
 
     # ── EVM: DexScreener public token API ─────────────────────────────────────
     elif chain_lower in ("ethereum", "eth", "base", "bsc", "arbitrum"):
@@ -19754,6 +19619,8 @@ def main():
     from safe_bot import SafeMarkdownBot
     app = Application.builder().bot(SafeMarkdownBot(token=BOT_TOKEN)).build()
     _register_handlers(app)
+    from datetime import time as _dt_time   # daily jobs run in BOT_TIMEZONE (default UTC)
+    logger.info("Scheduling daily jobs in timezone %s", BOT_TIMEZONE_NAME)
 
     app.job_queue.run_repeating(checker_job,           interval=PRICE_CHECK_INTERVAL,       first=10)
     app.job_queue.run_repeating(apex_checker_job,      interval=APEX_PRICE_CHECK_INTERVAL,  first=15)
@@ -19763,10 +19630,10 @@ def main():
     app.job_queue.run_repeating(group_leaderboard_tracker_job, interval=300, first=150)
     app.job_queue.run_repeating(autosave_job,          interval=120,  first=120)
     # dump_log_drain_job removed — scan log channel feature disabled
-    app.job_queue.run_daily(daily_summary_job,           time=__import__("datetime").time(23, 59))
-    app.job_queue.run_daily(monthly_report_job,          time=__import__("datetime").time(8,  0))
-    app.job_queue.run_daily(weekly_filter_analysis_job,       time=__import__("datetime").time(9,  0))
-    app.job_queue.run_daily(apex_auto_apply_suggestions_job,   time=__import__("datetime").time(0, 10))
+    app.job_queue.run_daily(daily_summary_job,           time=_dt_time(23, 59, tzinfo=BOT_TZ))
+    app.job_queue.run_daily(monthly_report_job,          time=_dt_time(8, 0, tzinfo=BOT_TZ))
+    app.job_queue.run_daily(weekly_filter_analysis_job,       time=_dt_time(9, 0, tzinfo=BOT_TZ))
+    app.job_queue.run_daily(apex_auto_apply_suggestions_job,   time=_dt_time(0, 10, tzinfo=BOT_TZ))
     app.job_queue.run_repeating(rejected_token_outcome_job,    interval=3600, first=300)
 
     # APEX midnight self-calibration
@@ -19774,7 +19641,7 @@ def main():
         for _uid2, _ud2 in list(users.items()):
             if _ud2.get("apex_mode"):
                 apex_self_calibrate(_ud2, _uid2, suggest_only=False)
-    app.job_queue.run_daily(_apex_midnight_calibrate, time=__import__("datetime").time(0, 5))
+    app.job_queue.run_daily(_apex_midnight_calibrate, time=_dt_time(0, 5, tzinfo=BOT_TZ))
 
     # Hand persistence references to the live state (it must never import this
     # module: under `python sol_trading_bot.py` that creates a second, empty copy).
