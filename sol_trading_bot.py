@@ -213,6 +213,7 @@ _user_locks:        dict = {}  # asyncio.Lock per uid — prevents concurrent bu
 
 from persistence import load_all, save_user, save_trade_log, autosave_job, register_state
 from access import access_allowed as _access_allowed_pure, make_gate as _make_gate
+from slippage import trade_cost_usd as _sim_trade_cost, slippage_pct as _sim_slippage_pct
 from text_safety import (
     md_escape, llm_safe, llm_safe_list, build_llm_user_prompt,
     LLM_SYSTEM_PROMPT, merge_advisory_verdict,
@@ -1974,11 +1975,15 @@ async def enrich_volume_pattern(contract: str, api_key: str) -> dict:
         return result
 
 
-async def get_token(contract: str, force: bool = False) -> dict | None:
+async def get_token(contract: str, force: bool = False, max_age: float | None = None) -> dict | None:
+    """DexScreener token lookup with a CACHE_TTL cache. max_age (seconds)
+    tightens the cache for this call — used at fill time so trades don't
+    execute against a quote that is up to 30s old."""
+    _ttl = CACHE_TTL if max_age is None else min(CACHE_TTL, max(0.0, max_age))
     # ── Cache check ──────────────────────────────────────────────────────────
     if not force:
         cached = _token_cache.get(contract)
-        if cached and (_time.time() - cached["ts"]) < CACHE_TTL:
+        if cached and (_time.time() - cached["ts"]) < _ttl:
             return cached["data"]
     try:
         client = await get_http()
@@ -3484,7 +3489,16 @@ def check_daily(d: dict) -> bool:
     return not (lim and d["daily_trades"] >= lim)
 
 
-def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reason: str = "manual") -> dict:
+def _cached_liq(contract: str) -> float | None:
+    """Pool liquidity (USD) from the most recent get_token() result, if any."""
+    _c = _token_cache.get(contract)
+    if _c and isinstance(_c.get("data"), dict):
+        return _c["data"].get("liq")
+    return None
+
+
+def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reason: str = "manual",
+              liq: float | None = None) -> dict:
     h = ud["holdings"][contract]
     tokens = usd / price
     ratio = min(tokens / h["amount"], 1.0) if h["amount"] > 0 else 1.0
@@ -3493,7 +3507,8 @@ def sell_core(ud: dict, uid: int, contract: str, usd: float, price: float, reaso
     # ── Simulated trading costs on sell (gas + DEX fee + slippage) ───────────
     _sell_fee = 0.0
     if SIM_FEES_ENABLED:
-        _sell_fee = round(usd * SIM_TOTAL_PCT + SIM_GAS_USD, 4)
+        # DEX fee + max(0.5% floor, constant-product price impact) + gas
+        _sell_fee = _sim_trade_cost(usd, liq if liq is not None else _cached_liq(contract))
         usd = round(usd - _sell_fee, 4)   # net proceeds after fees
         ud["total_fees_paid"] = round(ud.get("total_fees_paid", 0.0) + _sell_fee, 4)
         h.setdefault("total_fees_paid", 0.0)
@@ -10600,7 +10615,7 @@ async def apex_process_entry_queue(app, uid: int, ud: dict) -> None:
                           "Rug Risk: *" + ai.get("rug_risk", "?") + "*\n\n"
                           "\U0001f4dd " + _mde(ai.get("thesis", "\u2014")) + "\n\n"
                           "\U0001f4b5 Bought: *" + money(buy_amt) + "*"
-                          + (" | Fee: *" + money(round(buy_amt * SIM_TOTAL_PCT + SIM_GAS_USD, 4)) + "*" if SIM_FEES_ENABLED else "") + "\n"
+                          + (" | Fee: *" + money(_sim_trade_cost(buy_amt, info_post.get("liq"))) + "*" if SIM_FEES_ENABLED else "") + "\n"
                           "Entry MC: *" + mc_str(info_post["mc"]) + "*\n"
                           "Heat: *" + str(heat) + "%*  |  Positions: *" + str(apex_count_positions(ud)) + "/\u221e*\n"
                           "\U0001f6d1 SL: *" + str(h["stop_loss_pct"]) + "%*  |  \U0001f501 Trail: *activates at 1.5x*"),
@@ -12234,7 +12249,8 @@ async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, plan
     else:
         if usd_amount > ud["balance"]:
             return "Insufficient balance. You have " + money(ud["balance"]) + "."
-    info = await get_token(contract)
+    # Refresh the quote at fill time if the cached one is older than a few seconds.
+    info = await get_token(contract, max_age=FILL_MAX_PRICE_AGE_S)
     if not info:
         return "Token not found on DexScreener."
     tokens = usd_amount / info["price"]
@@ -12242,7 +12258,8 @@ async def do_buy_core(ud: dict, uid: int, contract: str, usd_amount: float, plan
     # ── Simulated trading costs (gas + DEX fee + slippage) ───────────────────
     _fee_cost = 0.0
     if SIM_FEES_ENABLED:
-        _fee_cost = round(usd_amount * SIM_TOTAL_PCT + SIM_GAS_USD, 4)
+        # DEX fee + max(0.5% floor, constant-product price impact) + gas
+        _fee_cost = _sim_trade_cost(usd_amount, info.get("liq"))
         if vault_buy:
             _avail = ud.get("apex_vault", 0.0) - usd_amount
             _fee_cost = min(_fee_cost, max(0.0, _avail))
@@ -12528,7 +12545,7 @@ async def do_sell_query(q, ud, uid, contract, pct=None, usd=None):
     if contract not in ud["holdings"]:
         await q.edit_message_text("Position not found.", reply_markup=back_main())
         return
-    info = await get_token(contract)
+    info = await get_token(contract, max_age=FILL_MAX_PRICE_AGE_S)  # fresh quote at fill time
     if not info:
         await q.edit_message_text("Price unavailable.", reply_markup=back_main())
         return
@@ -12550,7 +12567,7 @@ async def do_sell_query(q, ud, uid, contract, pct=None, usd=None):
         ud["best_streak"]     = max(ud["best_streak"], ud["streak"])
     ud["daily_trades"] += 1
     avg    = h.get("avg_price", info["price"])
-    result = sell_core(ud, uid, contract, usd_amount, info["price"])
+    result = sell_core(ud, uid, contract, usd_amount, info["price"], liq=info.get("liq"))
     cx     = info["price"] / avg if avg > 0 else 0
     warn      = "\n\nSold before auto-sell targets - rule broken" if pending_targets else ""
     save_line = "\nAuto-saved: " + money(result["auto_saved"]) if result["auto_saved"] > 0 else ""
@@ -12581,7 +12598,7 @@ async def do_sell_msg(update, ud, uid, contract, pct=None, usd=None):
     if contract not in ud["holdings"]:
         await update.message.reply_text("Position not found.", reply_markup=back_main())
         return
-    info = await get_token(contract)
+    info = await get_token(contract, max_age=FILL_MAX_PRICE_AGE_S)  # fresh quote at fill time
     if not info:
         await update.message.reply_text("Price unavailable.", reply_markup=back_main())
         return
@@ -12600,7 +12617,7 @@ async def do_sell_msg(update, ud, uid, contract, pct=None, usd=None):
         ud["best_streak"]     = max(ud["best_streak"], ud["streak"])
     ud["daily_trades"] += 1
     avg    = h.get("avg_price", info["price"])
-    result = sell_core(ud, uid, contract, usd_amount, info["price"])
+    result = sell_core(ud, uid, contract, usd_amount, info["price"], liq=info.get("liq"))
     cx     = info["price"] / avg if avg > 0 else 0
     save_line = "\nAuto-saved: " + money(result["auto_saved"]) if result["auto_saved"] > 0 else ""
     await update.message.reply_text(
