@@ -5,3 +5,8 @@ __pycache__/
 *.db-shm
 .venv/
 .pytest_cache/
+webapp/node_modules/
+webapp/dist/
+webapp/dev-dist/
+webapp/.env
+webapp/.env.local
