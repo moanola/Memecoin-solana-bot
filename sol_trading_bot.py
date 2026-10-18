@@ -212,6 +212,7 @@ _user_locks:        dict = {}  # asyncio.Lock per uid — prevents concurrent bu
 
 
 from persistence import load_all, save_user, save_trade_log, autosave_job, register_state
+from access import access_allowed as _access_allowed_pure, make_gate as _make_gate
 _http: httpx.AsyncClient | None = None
 
 async def get_http() -> httpx.AsyncClient:
@@ -3066,6 +3067,20 @@ def score_token(info: dict) -> dict:
         "strengths": strengths[:3],
         "warnings":  warnings[:3],
     }
+
+
+def user_has_access(uid: int) -> bool:
+    """Single access check used by every handler. Never creates a user record."""
+    return _access_allowed_pure(uid, users, ADMIN_IDS, ACCESS_CONTROL_ENABLED)
+
+
+# Decorator applied to every handler at registration (see _register_handlers).
+access_gate = _make_gate(
+    get_users=lambda: users,
+    get_admin_ids=lambda: ADMIN_IDS,
+    is_enabled=lambda: ACCESS_CONTROL_ENABLED,
+    admin_username=lambda: ACCESS_ADMIN_USERNAME,
+)
 
 
 def get_user(uid: int, uname: str) -> dict:
@@ -8410,61 +8425,65 @@ async def bundle_sell_detector(app):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    ud = get_user(u.id, u.username or u.first_name)
+    if not u:
+        return  # channel posts — no user attached
+    # /start is the access-request entry point, so it is not wrapped by
+    # access_gate(); it applies the same user_has_access() check below.
+    # No user record is created until the user is approved.
 
     # ── ACCESS CONTROL GATE ───────────────────────────────────────────────────
-    if ACCESS_CONTROL_ENABLED and not is_admin(u.id):
-        # Already approved users pass through instantly
-        if not ud.get("access_approved"):
-            # Already waiting — just remind them
-            if u.id in _pending_access:
-                if update.message:
-                    await update.message.reply_text(
-                        "⏳ Your access request is pending admin approval.\n\n"
-                        "Please contact @" + ACCESS_ADMIN_USERNAME + " if you haven't already."
-                    )
-                return
-            # New request — notify all admins
-            _raw_name     = u.full_name or u.first_name or "Unknown"
-            _raw_username = "@" + u.username if u.username else "no username"
-            _pending_access[u.id] = {
-                "name":     _raw_name,
-                "username": _raw_username,
-            }
-            # Escape ALL user-controlled strings — names/usernames with underscores
-            # or asterisks cause Telegram Markdown BadRequest which was silently
-            # swallowed, meaning admin NEVER received new-user notifications.
-            _safe_name = _md(_raw_name)
-            _safe_uname = _raw_username.replace("_", "\\_")
-            for _aid in ADMIN_IDS:
-                try:
-                    await ctx.bot.send_message(
-                        chat_id=_aid,
-                        parse_mode="Markdown",
-                        text=(
-                            "🔔 *NEW ACCESS REQUEST*\n\n"
-                            "Name: *" + _safe_name + "*\n"
-                            "Username: " + _safe_uname + "\n"
-                            "User ID: `" + str(u.id) + "`"
-                        ),
-                        reply_markup=InlineKeyboardMarkup([
-                            [
-                                InlineKeyboardButton("✅ Approve", callback_data="access_approve_" + str(u.id)),
-                                InlineKeyboardButton("❌ Deny",    callback_data="access_deny_"    + str(u.id)),
-                            ]
-                        ])
-                    )
-                except Exception as _notify_err:
-                    logger.error(f"Access notify to admin {_aid} failed: {_notify_err}")
+    if not user_has_access(u.id):
+        # Not approved yet (admins and approved users skip this block)
+        # Already waiting — just remind them
+        if u.id in _pending_access:
             if update.message:
                 await update.message.reply_text(
-                    "🔒 *Access Required*\n\n"
-                    "This bot is private. Your request has been sent to the admin.\n\n"
-                    "Please contact @" + ACCESS_ADMIN_USERNAME.replace("_", "\\_") + " for access.",
-                    parse_mode="Markdown"
+                    "⏳ Your access request is pending admin approval.\n\n"
+                    "Please contact @" + ACCESS_ADMIN_USERNAME + " if you haven't already."
                 )
             return
+        # New request — notify all admins
+        _raw_name     = u.full_name or u.first_name or "Unknown"
+        _raw_username = "@" + u.username if u.username else "no username"
+        _pending_access[u.id] = {
+            "name":     _raw_name,
+            "username": _raw_username,
+        }
+        # Escape ALL user-controlled strings — names/usernames with underscores
+        # or asterisks cause Telegram Markdown BadRequest which was silently
+        # swallowed, meaning admin NEVER received new-user notifications.
+        _safe_name = _md(_raw_name)
+        _safe_uname = _raw_username.replace("_", "\\_")
+        for _aid in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=_aid,
+                    parse_mode="Markdown",
+                    text=(
+                        "🔔 *NEW ACCESS REQUEST*\n\n"
+                        "Name: *" + _safe_name + "*\n"
+                        "Username: " + _safe_uname + "\n"
+                        "User ID: `" + str(u.id) + "`"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ Approve", callback_data="access_approve_" + str(u.id)),
+                            InlineKeyboardButton("❌ Deny",    callback_data="access_deny_"    + str(u.id)),
+                        ]
+                    ])
+                )
+            except Exception as _notify_err:
+                logger.error(f"Access notify to admin {_aid} failed: {_notify_err}")
+        if update.message:
+            await update.message.reply_text(
+                "🔒 *Access Required*\n\n"
+                "This bot is private. Your request has been sent to the admin.\n\n"
+                "Please contact @" + ACCESS_ADMIN_USERNAME.replace("_", "\\_") + " for access.",
+                parse_mode="Markdown"
+            )
+        return
     # ── END ACCESS GATE ───────────────────────────────────────────────────────
+    ud = get_user(u.id, u.username or u.first_name)
 
     # ── Block /start in groups — bot should only respond to CAs there ───────
     if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
@@ -12591,12 +12610,12 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if users.get(u.id, {}).get("admin_banned"):
         await update.message.reply_text("⛔ Your account has been suspended. Contact support.")
         return
-    if ACCESS_CONTROL_ENABLED and not is_admin(u.id):
-        if not users.get(u.id, {}).get("access_approved"):
-            await update.message.reply_text(
-                "🔒 Access required. Contact @" + ACCESS_ADMIN_USERNAME + " to request access."
-            )
-            return
+    if not user_has_access(u.id):
+        # Also enforced by access_gate() at registration; kept as defence in depth.
+        await update.message.reply_text(
+            "🔒 Access required. Contact @" + ACCESS_ADMIN_USERNAME + " to request access."
+        )
+        return
     ud = get_user(u.id, u.username or u.first_name)
     message = update.message          # shorthand used throughout handler
     text = message.text.strip()
@@ -14217,7 +14236,6 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not u:
         return  # Ignore channel posts
-    ud = get_user(u.id, u.username or u.first_name)
     cb = q.data
 
     # ── ACCESS CONTROL APPROVE / DENY (admin only) ────────────────────────────
@@ -14268,6 +14286,9 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
     # ── END ACCESS CALLBACKS ──────────────────────────────────────────────────
+    # Created only after the access callbacks so an unapproved user pressing a
+    # (forged) approve/deny button never gets a user record.
+    ud = get_user(u.id, u.username or u.first_name)
 
     # ── GROUP MODE: Rescan button (grp_rf_) — safe, only public token data ─────
     if cb.startswith("grp_rf_"):
@@ -19666,6 +19687,20 @@ async def dump_log_drain_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             logger.debug(f"Dump log drain: {sent} sent for uid={uid}, {len(queue)} remaining")
 
 
+def _register_handlers(app) -> None:
+    """Every handler goes through access_gate except /start, which is the
+    access-request entry point and applies the same user_has_access() check."""
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu",  access_gate(cmd_start)))
+    app.add_handler(CommandHandler("admin", access_gate(cmd_admin)))
+    app.add_handler(CommandHandler("lb",    access_gate(cmd_leaderboard)))
+    app.add_handler(CommandHandler("stats", access_gate(cmd_user_stats)))
+    app.add_handler(CommandHandler("pnl",   access_gate(cmd_pnl)))
+    app.add_handler(CommandHandler("gpnl",  access_gate(cmd_group_pnl)))
+    app.add_handler(CallbackQueryHandler(access_gate(btn)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, access_gate(text_handler)))
+
+
 def _register_persistence_state() -> None:
     register_state(
         users, trade_log,
@@ -19680,15 +19715,7 @@ def _register_persistence_state() -> None:
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu",  cmd_start))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("lb",    cmd_leaderboard))
-    app.add_handler(CommandHandler("stats", cmd_user_stats))
-    app.add_handler(CommandHandler("pnl",   cmd_pnl))
-    app.add_handler(CommandHandler("gpnl",  cmd_group_pnl))
-    app.add_handler(CallbackQueryHandler(btn))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    _register_handlers(app)
 
     app.job_queue.run_repeating(checker_job,           interval=PRICE_CHECK_INTERVAL,       first=10)
     app.job_queue.run_repeating(apex_checker_job,      interval=APEX_PRICE_CHECK_INTERVAL,  first=15)
